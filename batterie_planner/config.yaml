@@ -1,0 +1,19 @@
+name: Batterie-Planer v2
+version: "1.0.0"
+slug: batterie_planner
+description: Stuendlicher Batterie-Fahrplan (rolling horizon) fuer die Marstek-v2-Steuerung, publiziert retained per MQTT
+url: https://github.com/AlferNL/ha-batterie-planner
+arch:
+  - amd64
+  - aarch64
+init: false
+homeassistant_api: true
+watchdog: false
+options:
+  einstand_start: 0.15
+  profil_tage: 14
+  takt_minute: 55
+schema:
+  einstand_start: float
+  profil_tage: int(1,30)
+  takt_minute: int(0,59)
