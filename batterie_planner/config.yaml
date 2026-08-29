@@ -8,7 +8,6 @@ arch:
   - aarch64
 init: false
 homeassistant_api: true
-watchdog: false
 options:
   einstand_start: 0.15
   profil_tage: 14
