@@ -105,9 +105,12 @@ def parse_iso(text):
 
 
 def melde(titel, nachricht):
+    # Feste notification_id: eine wiederholte Stoerung ERSETZT ihre Meldung,
+    # statt sie stuendlich zu stapeln (Nacht 29./30.08.: 13 identische Meldungen).
     try:
         dienst("persistent_notification", "create",
-               {"title": titel, "message": nachricht})
+               {"title": titel, "message": nachricht,
+                "notification_id": "batterie_planner_v2"})
     except Exception as e:
         log("WARNUNG: Meldung fehlgeschlagen: %s" % e)
 
@@ -544,7 +547,7 @@ def plan_aktionen(opt, ab_stunde, entl_max_w):
     return aktionen
 
 
-def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w):
+def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kwh):
     # Notbremse vor jedem Publish: bei Verstoss wird NICHT publiziert.
     fehler = []
     if len(aktionen) != 24:
@@ -562,7 +565,12 @@ def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w):
         if a["h"] >= ab_stunde and fehlt[a["h"]] and a["aktion"] not in ("RUHE", "VORBEI"):
             fehler.append("Stunde %d: Aktion %s trotz gesperrtem Preis."
                           % (a["h"], a["aktion"]))
-    boden = KAP_KWH * BODEN_PCT / 100.0
+    # Steht der Akku REAL unter dem Boden (z.B. 11.9 % nach einem Entladeabend),
+    # ist das kein Planfehler: der Optimierer kann die Bahn nie unter den Start
+    # druecken (Start-Entnahme ist bei start_frei=0 gesperrt, Paar-Trades kehren
+    # zur Basis zurueck). Untergrenze ist darum min(Boden, Ist-Start).
+    # Bug 1.0.0 (Nacht 29./30.08.): fester Boden blockierte 13 Laeufe in Folge.
+    boden = min(KAP_KWH * BODEN_PCT / 100.0, soc_start_kwh)
     for h, s in enumerate(opt["soc"]):
         if s < boden - 1e-6 or s > KAP_KWH + 1e-6:
             fehler.append("SoC-Bahn Stunde %d ausserhalb der Grenzen (%.2f kWh)." % (h, s))
@@ -656,12 +664,13 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
             netto[h] = round(profil[h] - pv[h], 4)
 
     soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
-    opt = optimiere(pk["imp"], pk["ter"], netto, KAP_KWH * soc_pct / 100.0,
+    soc_start_kwh = KAP_KWH * soc_pct / 100.0
+    opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh,
                     float(opts.get("einstand_start", 0.15)),
                     cfg["rt"], cfg["puffer"], cfg["entl_max_w"])
     aktionen = plan_aktionen(opt, ab_stunde, cfg["entl_max_w"])
 
-    fehler = pruefe_invarianten(aktionen, opt, pk["fehlt"], ab_stunde, cfg["entl_max_w"])
+    fehler = pruefe_invarianten(aktionen, opt, pk["fehlt"], ab_stunde, cfg["entl_max_w"], soc_start_kwh)
     if fehler:
         detail = "%s: Invarianten verletzt, Plan NICHT publiziert: %s" % (anlass, " | ".join(fehler))
         log("FEHLER: " + detail)
