@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 (2026-09-01)
+
+- **Block-Bewertung statt haus/export-Trennung:** Greedy und Umschicht-Pass
+  bewerten eine Entladestunde jetzt als EINEN Block (Hausbedarf zuerst zum
+  Einkaufspreis, Rest als Export zum Teruglever-Wert, gemischter kWh-Wert).
+  Vorher konnte eine Stunde mit kleinem Rest-Hausbedarf nie einen vollen
+  800-W-Block gewinnen: Export war erst nach Haus-Deckung erlaubt, und der
+  Haus-Kruemel verlor als Einzelzug gegen volle Export-Bloecke spaeterer,
+  schlechterer Stunden. Befund 2026-09-01: der 08:55-Replan liess Stunde 9
+  (21,5 ct Marge, 0,14 kWh Rest-Hausbedarf) leer und verkaufte stattdessen
+  in Stunde 10 (17,3 ct) und 11 (10,4 ct); der 07:43-Plan gab Stunde 10 den
+  vollen Block und Stunde 9 die Reste. Die physische Regel bleibt: Haus
+  zuerst, dann Export (nettierender P1); der unabhaengige Simulator prueft
+  sie weiterhin je Stunde.
+- **Selbsttest beim Start:** das 08:55-Szenario ist als Regressionstest fest
+  eingebaut und laeuft bei jedem Add-on-Start (lokal, < 1 s). Schlaegt er
+  fehl, stoppt das Add-on OHNE Publish; der alte retained Plan bleibt
+  stehen und der anti_feed-Fallback greift.
+
 ## 1.1.0 (2026-09-01)
 
 - **Echter Einstand statt 15-ct-Konstante:** das Add-on fuehrt den gewichteten

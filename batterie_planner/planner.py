@@ -484,6 +484,27 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
         entlaedt = (entl_haus[h] + entl_exp[h]) > 1e-9
         return (not entlaedt) if soll == "laden" else (not laedt)
 
+    def block_kandidaten(k, raus_max):
+        # Block-Bewertung (1.2.0): Entladung in Stunde k wird Haus-zuerst
+        # abgerechnet (nettierender P1: solange die Stunde Netzbezug hat,
+        # mindert Entladung nur den Import, erst danach ist es Export).
+        # Kandidaten in GELIEFERTEN kWh: (a) nur den Hausbedarf decken,
+        # (b) voller Block = Haus decken + Rest exportieren, bewertet zum
+        # gemischten kWh-Wert. So konkurriert eine Stunde mit kleinem
+        # Rest-Hausbedarf als ganzer Block statt als Kruemel (Befund
+        # 2026-09-01: 800-W-Block ging an die reine Exportstunde 10 statt
+        # an die bessere Mischstunde 9).
+        kand = []
+        if raus_max <= 1e-6:
+            return kand
+        h_teil = min(bedarf[k], raus_max)
+        if h_teil > 1e-6:
+            kand.append((h_teil, imp[k]))
+        if raus_max - h_teil > 1e-6:
+            wert = (h_teil * imp[k] + (raus_max - h_teil) * ter[k]) / raus_max
+            kand.append((raus_max, wert))
+        return kand
+
     for _ in range(MAX_ITER):
         best_marge = puffer - 1e-12
         best = None
@@ -493,71 +514,54 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
             entl_rest = entl_max - (entl_haus[k] + entl_exp[k])
             if entl_rest <= 1e-9:
                 continue
-            for senke in ("haus", "export"):
-                if senke == "haus" and bedarf[k] <= 1e-9:
-                    continue
-                # Solange die Stunde Netzbezug hat, wirkt Entladung am nettieren-
-                # den P1 nur als Import-Minderung; echter Export erst danach.
-                if senke == "export" and bedarf[k] > 1e-9:
-                    continue
-                wert = imp[k] if senke == "haus" else ter[k]
-                # --- Quelle Startinhalt (jederzeit verfuegbar) ---
-                if start_frei > 1e-9:
+            # --- Quelle Startinhalt (jederzeit verfuegbar) ---
+            if start_frei > 1e-9:
+                frei = start_frei
+                for t in range(k, n):
+                    frei = min(frei, soc[t] - boden)
+                raus_max = min(frei * sqrt_rt, entl_rest)
+                for raus, wert in block_kandidaten(k, raus_max):
                     m = sqrt_rt * wert - einstand_start
                     if m > best_marge:
-                        frei = start_frei
-                        for t in range(k, n):
-                            frei = min(frei, soc[t] - boden)
-                        meter = min(frei * sqrt_rt, entl_rest)
-                        if senke == "haus":
-                            meter = min(meter, bedarf[k])
-                        if meter > 1e-6:
-                            best_marge = m
-                            best = {"art": "start", "s": -1, "k": k,
-                                    "senke": senke, "meter": meter, "marge": m}
-                # --- Quellen Netz / PV in frueherer Stunde ---
-                for s in range(k):
-                    if not richtung_ok(s, "laden"):
+                        h_raus = min(bedarf[k], raus)
+                        best_marge = m
+                        best = {"art": "start", "s": -1, "k": k, "meter": raus,
+                                "h_raus": h_raus, "e_raus": raus - h_raus}
+            # --- Quellen Netz / PV in frueherer Stunde ---
+            for s in range(k):
+                if not richtung_ok(s, "laden"):
+                    continue
+                for quelle in ("netz", "pv"):
+                    if quelle == "pv" and pv_frei[s] <= 1e-9:
                         continue
-                    for quelle in ("netz", "pv"):
-                        if quelle == "pv" and pv_frei[s] <= 1e-9:
-                            continue
-                        kost = imp[s] if quelle == "netz" else ter[s]
+                    kost = imp[s] if quelle == "netz" else ter[s]
+                    # Gesamt-Ladekappe: Netz+PV zusammen nie ueber Hardware-Max.
+                    gesamt_rest = lad_pv - (lad_netz_m[s] + lad_pv_m[s])
+                    if quelle == "netz":
+                        lad_rest = min(lad_netz - lad_netz_m[s], gesamt_rest)
+                    else:
+                        lad_rest = min(lad_pv - lad_pv_m[s], pv_frei[s], gesamt_rest)
+                    if lad_rest <= 1e-9:
+                        continue
+                    kopf = KAP_KWH - soc[s]
+                    for t in range(s, k):
+                        kopf = min(kopf, KAP_KWH - soc[t])
+                    raus_max = min(lad_rest, kopf / sqrt_rt, entl_rest / rt) * rt
+                    for raus, wert in block_kandidaten(k, raus_max):
                         m = rt * wert - kost
-                        if m <= best_marge:
-                            continue
-                        # Gesamt-Ladekappe: Netz+PV zusammen nie ueber Hardware-Max.
-                        gesamt_rest = lad_pv - (lad_netz_m[s] + lad_pv_m[s])
-                        if quelle == "netz":
-                            lad_rest = min(lad_netz - lad_netz_m[s], gesamt_rest)
-                        else:
-                            lad_rest = min(lad_pv - lad_pv_m[s], pv_frei[s], gesamt_rest)
-                        if lad_rest <= 1e-9:
-                            continue
-                        kopf = KAP_KWH - soc[s]
-                        for t in range(s, k):
-                            kopf = min(kopf, KAP_KWH - soc[t])
-                        meter = min(lad_rest, kopf / sqrt_rt, entl_rest / rt)
-                        if senke == "haus":
-                            meter = min(meter, bedarf[k] / rt)
-                        if meter > 1e-6:
+                        if m > best_marge:
+                            h_raus = min(bedarf[k], raus)
                             best_marge = m
-                            best = {"art": quelle, "s": s, "k": k,
-                                    "senke": senke, "meter": meter, "marge": m}
+                            best = {"art": quelle, "s": s, "k": k, "meter": raus / rt,
+                                    "h_raus": h_raus, "e_raus": raus - h_raus}
         if best is None:
             break
         k = best["k"]
-        senke = best["senke"]
         if best["art"] == "start":
             st = best["meter"] / sqrt_rt
             start_frei -= st
             for t in range(k, n):
                 soc[t] -= st
-            raus = best["meter"]
-            trades.append("Startinhalt %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
-                          % (raus, senke, k, best["marge"] * 100))
-            struktur.append({"art": "start", "s": -1, "k": k, "senke": senke,
-                             "meter": best["meter"]})
         else:
             s = best["s"]
             st = best["meter"] * sqrt_rt
@@ -568,16 +572,30 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
                 pv_frei[s] -= best["meter"]
             for t in range(s, k):
                 soc[t] += st
-            raus = best["meter"] * rt
-            trades.append("%s %02dh %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
-                          % (best["art"], s, best["meter"], senke, k, best["marge"] * 100))
-            struktur.append({"art": best["art"], "s": s, "k": k, "senke": senke,
-                             "meter": best["meter"]})
-        if senke == "haus":
-            entl_haus[k] += raus
-            bedarf[k] = max(0.0, bedarf[k] - raus)
-        else:
-            entl_exp[k] += raus
+        # Block ggf. in Haus- und Export-Anteil aufteilen (getrennte Buchungen,
+        # damit Simulator und Bilanz je Senke korrekt rechnen).
+        for senke, raus in (("haus", best["h_raus"]), ("export", best["e_raus"])):
+            if raus <= 1e-9:
+                continue
+            if best["art"] == "start":
+                marge = sqrt_rt * (imp[k] if senke == "haus" else ter[k]) - einstand_start
+                trades.append("Startinhalt %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
+                              % (raus, senke, k, marge * 100))
+                struktur.append({"art": "start", "s": -1, "k": k, "senke": senke,
+                                 "meter": raus})
+            else:
+                s = best["s"]
+                kost = imp[s] if best["art"] == "netz" else ter[s]
+                marge = rt * (imp[k] if senke == "haus" else ter[k]) - kost
+                trades.append("%s %02dh %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
+                              % (best["art"], s, raus / rt, senke, k, marge * 100))
+                struktur.append({"art": best["art"], "s": s, "k": k, "senke": senke,
+                                 "meter": raus / rt})
+            if senke == "haus":
+                entl_haus[k] += raus
+                bedarf[k] = max(0.0, bedarf[k] - raus)
+            else:
+                entl_exp[k] += raus
 
     eur = 0.0
     for h in range(n):
@@ -710,54 +728,69 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
                 if entl_rest_k1 < 0.05:
                     continue
                 bedarf_rest_k1 = max(0.0, bedarf0[k1] - best["entl_haus"][k1])
-                for senke1 in ("haus", "export"):
-                    if senke1 == "haus" and bedarf_rest_k1 < 0.05:
+                for s in range(k1 + 1, k2):
+                    if imp[s] > 500:
                         continue
-                    if senke1 == "export" and bedarf_rest_k1 > 1e-3:
-                        continue
-                    wert1 = imp[k1] if senke1 == "haus" else ter[k1]
-                    # Gate fuer das neue fruehe Entladen (gleiche Quelle wie t)
-                    if t["art"] == "start":
-                        m1 = sqrt_rt * wert1 - einstand
-                    else:
-                        m1 = rt * wert1 - (imp[t["s"]] if t["art"] == "netz" else ter[t["s"]])
-                    if m1 <= puffer:
-                        continue
-                    for s in range(k1 + 1, k2):
-                        if imp[s] > 500:
-                            continue
-                        for nach_art in ("netz", "pv"):
-                            if nach_art == "pv":
-                                pv_rest_s = max(0.0, -netto[s]) - best["lad_pv"][s]
-                                if pv_rest_s < 0.05:
-                                    continue
-                                kost = ter[s]
-                                lad_rest = min(lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]), pv_rest_s)
-                            else:
-                                kost = imp[s]
-                                lad_rest = min(lad_netz - best["lad_netz"][s],
-                                               lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]))
-                            if lad_rest < 0.05:
+                    for nach_art in ("netz", "pv"):
+                        if nach_art == "pv":
+                            pv_rest_s = max(0.0, -netto[s]) - best["lad_pv"][s]
+                            if pv_rest_s < 0.05:
                                 continue
-                            wert2 = imp[k2] if t["senke"] == "haus" else ter[k2]
-                            if rt * wert2 - kost <= puffer:
+                            kost = ter[s]
+                            lad_rest = min(lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]), pv_rest_s)
+                        else:
+                            kost = imp[s]
+                            lad_rest = min(lad_netz - best["lad_netz"][s],
+                                           lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]))
+                        if lad_rest < 0.05:
+                            continue
+                        wert2 = imp[k2] if t["senke"] == "haus" else ter[k2]
+                        if rt * wert2 - kost <= puffer:
+                            continue
+                        raus_cap = min(raus_alt, entl_rest_k1, lad_rest * rt)
+                        if raus_cap < 0.05:
+                            continue
+                        h_teil_max = min(bedarf_rest_k1, raus_cap)
+                        # Block-Bewertung (1.2.0) wie im Greedy: Variante "haus"
+                        # deckt nur den Hausbedarf, Variante "block" verkauft den
+                        # vollen Block (Haus zuerst, Rest Export) zum gemischten
+                        # kWh-Wert. Ersetzt die alte haus/export-Trennung, bei
+                        # der eine Stunde mit kleinem Rest-Hausbedarf nie einen
+                        # vollen Block bekommen konnte (Befund 2026-09-01).
+                        for variante in ("haus", "block"):
+                            if variante == "haus":
+                                raus = h_teil_max
+                                if raus < 0.05:
+                                    continue
+                                h_teil, e_teil = raus, 0.0
+                                wert1 = imp[k1]
+                            else:
+                                raus = raus_cap
+                                h_teil = h_teil_max
+                                e_teil = raus - h_teil
+                                if e_teil < 1e-6:
+                                    continue  # identisch mit Variante "haus"
+                                wert1 = (h_teil * imp[k1] + e_teil * ter[k1]) / raus
+                            # Gate fuer das neue fruehe Entladen (gleiche Quelle wie t)
+                            if t["art"] == "start":
+                                m1 = sqrt_rt * wert1 - einstand
+                            else:
+                                m1 = rt * wert1 - (imp[t["s"]] if t["art"] == "netz" else ter[t["s"]])
+                            if m1 <= puffer:
                                 continue
                             # Kern-Ungleichung des Dreiecks
                             gewinn_kwh = wert1 - kost / rt
                             if gewinn_kwh <= puffer:
                                 continue
-                            raus = min(raus_alt, entl_rest_k1, lad_rest * rt)
-                            if senke1 == "haus":
-                                raus = min(raus, bedarf_rest_k1)
-                            if raus < 0.05:
-                                continue
-                            key = (idx, k1, senke1, s, nach_art)
+                            key = (idx, k1, variante, s, nach_art)
                             if key in verworfen:
                                 continue
                             if kandidat is None or gewinn_kwh * raus > kandidat["gewinn"]:
-                                kandidat = {"idx": idx, "k1": k1, "senke1": senke1,
-                                            "s": s, "nach_art": nach_art, "key": key,
-                                            "raus": raus, "gewinn": gewinn_kwh * raus}
+                                kandidat = {"idx": idx, "k1": k1, "s": s,
+                                            "nach_art": nach_art, "key": key,
+                                            "raus": raus, "h_teil": h_teil,
+                                            "e_teil": e_teil,
+                                            "gewinn": gewinn_kwh * raus}
         if kandidat is None:
             break
         t = st[kandidat["idx"]]
@@ -765,20 +798,31 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
         neu = [dict(x) for x in st]
         if t["art"] == "start":
             neu[kandidat["idx"]]["meter"] = t["meter"] - raus
-            neu.append({"art": "start", "s": -1, "k": kandidat["k1"],
-                        "senke": kandidat["senke1"], "meter": raus})
         else:
             neu[kandidat["idx"]]["meter"] = t["meter"] - raus / rt
-            neu.append({"art": t["art"], "s": t["s"], "k": kandidat["k1"],
-                        "senke": kandidat["senke1"], "meter": raus / rt})
+        for senke1, teil in (("haus", kandidat["h_teil"]), ("export", kandidat["e_teil"])):
+            if teil <= 1e-9:
+                continue
+            if t["art"] == "start":
+                neu.append({"art": "start", "s": -1, "k": kandidat["k1"],
+                            "senke": senke1, "meter": teil})
+            else:
+                neu.append({"art": t["art"], "s": t["s"], "k": kandidat["k1"],
+                            "senke": senke1, "meter": teil / rt})
         neu.append({"art": kandidat["nach_art"], "s": kandidat["s"], "k": t["k"],
                     "senke": t["senke"], "meter": raus / rt})
         probe = simuliere(neu, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w)
         if not probe["ok"] or probe["eur"] <= best["eur"] + 0.005:
             verworfen.add(kandidat["key"])
             continue
+        if kandidat["e_teil"] <= 1e-9:
+            beschr = "haus"
+        elif kandidat["h_teil"] <= 1e-9:
+            beschr = "export"
+        else:
+            beschr = "haus+export"
         log("UMSCHICHTUNG: %02dh-Buchung -> Verkauf %02dh (%s) + Nachkauf %02dh (%s), %.2f kWh, +%.2f EUR"
-            % (t["k"], kandidat["k1"], kandidat["senke1"], kandidat["s"],
+            % (t["k"], kandidat["k1"], beschr, kandidat["s"],
                kandidat["nach_art"], raus, probe["eur"] - best["eur"]))
         best = probe
         umschichtungen += 1
@@ -788,6 +832,59 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
         return opt
     best["eur"] = round(best["eur"], 4)
     return best
+
+
+def selbsttest():
+    # Regressions-Selbsttest beim Start (rein lokal, ohne HA/Netz, < 1 s):
+    # das 08:55-Szenario vom 2026-09-01, bei dem die alte haus/export-Trennung
+    # die beste Stunde 9 (kleiner Rest-Hausbedarf 0.14 kWh) leer ausgehen
+    # liess. Die Block-Bewertung muss ihr den vollen 800-W-Block geben.
+    # Schlaegt ein Check fehl, beendet sich das Add-on OHNE Publish: der alte
+    # retained Plan bleibt stehen, der anti_feed-Fallback im Haus greift.
+    rt, puffer, einstand = 0.85, 0.01, 0.15
+    beurs = [0.21, 0.19, 0.19, 0.18, 0.18, 0.19, 0.23, 0.25, 0.23, 0.19, 0.16,
+             0.11, 0.06, 0.04, 0.05, 0.06, 0.12, 0.17, 0.22, 0.25, 0.28, 0.27,
+             0.24, 0.22]
+    cfg = {"bonus_pct": 0.5, "v_faktor": 1.0, "venster_von": 6,
+           "venster_bis": 22, "belasting": 0.1108, "verkoop": 0.0,
+           "saldering": True}
+    imp = [b + 0.131 for b in beurs]
+    ter = [wert_terug(beurs[h], h, cfg) for h in range(24)]
+    netto = [0.0] * 24
+    netto[9] = 0.14
+    netto[12] = -0.2
+    netto[13] = -0.5
+    netto[14] = -0.4
+    netto[15] = -0.3
+    netto[19] = 0.23
+    netto[20] = 0.75
+    netto[21] = 0.25
+    netto[22] = 0.94
+    netto[23] = 0.30
+    for h in range(9):  # Replan ab 09:00, fruehere Stunden gesperrt
+        imp[h] = 999.0
+        ter[h] = -999.0
+    soc_start = 0.387 * KAP_KWH
+    opt = optimiere(imp, ter, netto, soc_start, einstand, rt, puffer, 800)
+    fein = verbessere(opt, imp, ter, netto, soc_start, einstand, rt, puffer, 800)
+    sim = simuliere(fein["struktur"], imp, ter, netto, soc_start, einstand, rt, 800)
+    fehler = []
+    if not sim["ok"]:
+        fehler.append("Simulator lehnt den Plan ab.")
+    if abs(sim["eur"] - fein["eur"]) > 0.005:
+        fehler.append("Simulator-Bilanz weicht ab (%.4f vs %.4f)."
+                      % (sim["eur"], fein["eur"]))
+    if fein["eur"] < opt["eur"] - 1e-6:
+        fehler.append("Umschicht-Pass verschlechtert die Bilanz.")
+    entl9 = sim["entl_haus"][9] + sim["entl_exp"][9]
+    if entl9 < 0.7:
+        fehler.append("Stunde 9 bekommt keinen vollen Block (%.2f kWh)." % entl9)
+    if sim["entl_exp"][9] <= 1e-6:
+        fehler.append("Stunde 9 exportiert nicht (Block-Bewertung wirkungslos).")
+    for h in range(24):
+        if sim["entl_haus"][h] + sim["entl_exp"][h] > 0.8 + 1e-6:
+            fehler.append("Stunde %d ueber 800 W." % h)
+    return fehler
 
 
 # ------------------------------------------------------- Plan bauen und pruefen
@@ -999,6 +1096,13 @@ def plan_morgen(state, opts):
 # ------------------------------------------------------------------- Hauptloop
 def main():
     global TZ
+    fehler = selbsttest()
+    if fehler:
+        for f in fehler:
+            log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
+        raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
+                         "(alter retained Plan bleibt stehen).")
+    log("Selbsttest bestanden (Block-Bewertung 1.2.0).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))

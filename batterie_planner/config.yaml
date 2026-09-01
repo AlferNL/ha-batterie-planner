@@ -1,5 +1,5 @@
 name: Batterie-Planer v2
-version: "1.1.0"
+version: "1.2.0"
 slug: batterie_planner
 description: Stuendlicher Batterie-Fahrplan (rolling horizon) fuer die Marstek-v2-Steuerung, publiziert retained per MQTT
 url: https://github.com/AlferNL/ha-batterie-planner
