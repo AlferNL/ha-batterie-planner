@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 (2026-09-01)
+
+- **Echter Einstand statt 15-ct-Konstante:** das Add-on fuehrt den gewichteten
+  Ist-Einkaufspreis der gespeicherten Energie im State mit (Netzladung zum
+  Stundenpreis, PV-Ladung zur Export-Opportunitaet, aus den kumulativen
+  Ladezaehlern zwischen zwei Laeufen). Anlass: die 04:00-Ladung zu 32 ct
+  all-in wurde ab 04:55 als 15-ct-Ware verplant, Margen waren geschoent.
+  `einstand_start` ist nur noch der Startwert bei leerem State.
+- **Umschicht-Pass gegen die Greedy-Luecke:** nach dem Greedy-Lauf prueft ein
+  Verbesserungs-Pass Dreiecksgeschaefte (frueh teuer verkaufen, spaeter billig
+  nachkaufen, Ziel-Stunde behalten; lohnt ab wert(k1) > kost(s)/rt). Jede
+  Umschichtung muss einen unabhaengigen Voll-Simulator (alle Kappen, SoC-Bahn,
+  Richtungs- und Export-Regel) bestehen UND die Bilanz strikt verbessern,
+  sonst bleibt das Greedy-Ergebnis unveraendert. Anlass 2026-09-01: der
+  Morgen-Peak um 7 Uhr blieb ungenutzt, obwohl mittags fuer 4 ct Beurs
+  nachkaufbar war (~0,10-0,15 EUR verpasst).
+
 ## 1.0.1 (2026-08-30)
 
 - Fix Invarianten-Notbremse: Untergrenze der SoC-Bahn ist jetzt min(Boden,

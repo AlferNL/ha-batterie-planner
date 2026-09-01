@@ -239,6 +239,15 @@ def einkaufs_offset(karte):
     return 0.14
 
 
+def wert_terug(beurs_wert, h, cfg):
+    # Teruglever-Wert einer Stunde nach dem NextEnergy-Modell (live aus HA-Helfern).
+    bonus = 0.0
+    if cfg["venster_von"] <= h < cfg["venster_bis"] and beurs_wert > 0:
+        bonus = cfg["bonus_pct"] * beurs_wert * cfg["v_faktor"]
+    bel = cfg["belasting"] if cfg["saldering"] else 0.0
+    return round(beurs_wert - cfg["verkoop"] + bonus + bel, 4)
+
+
 def preis_kurven(tag0, karte, offset, cfg):
     # imp/ter je Stunde; fehlende Beurs-Stunden werden mit Sperr-Preisen
     # (999/-999) vom Handel ausgeschlossen statt als Phantom-0 gerechnet.
@@ -256,12 +265,61 @@ def preis_kurven(tag0, karte, offset, cfg):
             continue
         beurs[h] = karte[key]
         imp[h] = beurs[h] + offset
-        bonus = 0.0
-        if cfg["venster_von"] <= h < cfg["venster_bis"] and beurs[h] > 0:
-            bonus = cfg["bonus_pct"] * beurs[h] * cfg["v_faktor"]
-        bel = cfg["belasting"] if cfg["saldering"] else 0.0
-        ter[h] = round(beurs[h] - cfg["verkoop"] + bonus + bel, 4)
+        ter[h] = wert_terug(beurs[h], h, cfg)
     return {"imp": imp, "ter": ter, "beurs": beurs, "fehlt": fehlt}
+
+
+def einstand_pflegen(state, cfg, karte, offset):
+    # Fuehrt den ECHTEN gewichteten Einkaufspreis der gespeicherten Energie im
+    # State mit (statt der 15-ct-Konstante, Befund 2026-09-01: die 04:00-Ladung
+    # zu 32 ct all-in wurde ab 04:55 als 15-ct-Ware verplant). Quelle sind die
+    # kumulativen Ladezaehler seit dem letzten Lauf; Netzladung kostet imp der
+    # Stunde, PV-Ladung ihre Export-Opportunitaet (ter). Entladung aendert den
+    # Durchschnittspreis nicht. Einheit: EUR je GESPEICHERTER kWh.
+    sqrt_rt = math.sqrt(cfg["rt"])
+    boden = KAP_KWH * BODEN_PCT / 100.0
+    soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", -1)
+    lnet = zahl("sensor.batterij_laden_uit_net_kwh", -1)
+    lpv = zahl("sensor.batterij_laden_uit_pv_kwh", -1)
+    einstand = float(state.get("einstand", -1))
+    if einstand < 0:
+        einstand = float(state.get("einstand_start_fallback", 0.15))
+    if soc_pct < 0 or lnet < 0 or lpv < 0:
+        log("WARNUNG: Einstand-Update uebersprungen (Sensor nicht lesbar), bleibe bei %.1f ct." % (einstand * 100))
+        return einstand
+
+    nun = jetzt()
+    snap = state.get("einstand_snap")
+    if snap:
+        try:
+            alt_zeit = datetime.fromisoformat(snap["zeit"])
+            dt_h = (nun - alt_zeit).total_seconds() / 3600.0
+            dn = min(6.0, max(0.0, lnet - float(snap["lnet"])))
+            dp = min(6.0, max(0.0, lpv - float(snap["lpv"])))
+            if 0 < dt_h <= 3 and (dn + dp) > 0.02:
+                mitte = alt_zeit + (nun - alt_zeit) / 2
+                key = mitte.strftime("%Y-%m-%d %H")
+                if key in karte:
+                    beurs_h = karte[key]
+                    kost = dn * (beurs_h + offset) + dp * wert_terug(beurs_h, mitte.hour, cfg)
+                    e_alt = max(0.0, KAP_KWH * float(snap["soc"]) / 100.0 - boden)
+                    zugang = (dn + dp) * sqrt_rt
+                    if e_alt < 0.05:
+                        einstand = kost / zugang  # Akku war leer: nur die neue Ware zaehlt
+                    else:
+                        einstand = (e_alt * einstand + kost) / (e_alt + zugang)
+                    einstand = min(1.5, max(0.0, einstand))
+                    log("Einstand aktualisiert: %.1f ct/kWh (Zugang %.2f kWh Netz / %.2f kWh PV)"
+                        % (einstand * 100, dn, dp))
+        except (ValueError, KeyError, TypeError) as e:
+            log("WARNUNG: Einstand-Snapshot unlesbar (%s), setze neu auf." % e)
+    state["einstand_snap"] = {"zeit": nun.isoformat(), "lnet": lnet, "lpv": lpv, "soc": soc_pct}
+    state["einstand"] = round(einstand, 4)
+    try:
+        schreibe_json(STATE_PATH, state)
+    except OSError as e:
+        log("WARNUNG: State nicht schreibbar (%s)." % e)
+    return einstand
 
 
 def ist_dst_tag(tag0):
@@ -419,6 +477,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     soc = [soc_start_kwh] * n
     start_frei = max(0.0, soc_start_kwh - boden)
     trades = []
+    struktur = []  # maschinenlesbare Trade-Liste fuer den Umschicht-Pass
 
     def richtung_ok(h, soll):
         laedt = (lad_netz_m[h] + lad_pv_m[h]) > 1e-9
@@ -497,6 +556,8 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
             raus = best["meter"]
             trades.append("Startinhalt %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
                           % (raus, senke, k, best["marge"] * 100))
+            struktur.append({"art": "start", "s": -1, "k": k, "senke": senke,
+                             "meter": best["meter"]})
         else:
             s = best["s"]
             st = best["meter"] * sqrt_rt
@@ -510,6 +571,8 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
             raus = best["meter"] * rt
             trades.append("%s %02dh %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
                           % (best["art"], s, best["meter"], senke, k, best["marge"] * 100))
+            struktur.append({"art": best["art"], "s": s, "k": k, "senke": senke,
+                             "meter": best["meter"]})
         if senke == "haus":
             entl_haus[k] += raus
             bedarf[k] = max(0.0, bedarf[k] - raus)
@@ -521,7 +584,210 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
         eur += (pv_frei[h] + entl_exp[h]) * ter[h] - (bedarf[h] + lad_netz_m[h]) * imp[h]
     return {"eur": round(eur, 4), "lad_netz": lad_netz_m, "lad_pv": lad_pv_m,
             "entl_haus": entl_haus, "entl_exp": entl_exp, "soc": soc,
-            "trades": trades}
+            "trades": trades, "struktur": struktur}
+
+
+def simuliere(struktur, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w):
+    # Spielt eine Trade-Liste von Null durch und prueft ALLE Grenzen unabhaengig
+    # vom Greedy. Rueckgabe hat dieselbe Form wie optimiere() plus "ok".
+    n = len(netto)
+    sqrt_rt = math.sqrt(rt)
+    boden = KAP_KWH * BODEN_PCT / 100.0
+    entl_max = entl_max_w / 1000.0
+    lad_netz = LADEN_NETZ_MAX_W / 1000.0
+    lad_pv = LADEN_PV_MAX_W / 1000.0
+    bedarf0 = [max(0.0, x) for x in netto]
+    pv_frei0 = [max(0.0, -x) for x in netto]
+
+    lad_netz_m = [0.0] * n
+    lad_pv_m = [0.0] * n
+    entl_haus = [0.0] * n
+    entl_exp = [0.0] * n
+    soc = [soc_start_kwh] * n
+    start_verbraucht = 0.0
+    trades = []
+    for t in struktur:
+        m = t["meter"]
+        if m <= 1e-9:
+            continue
+        k = t["k"]
+        if t["art"] == "start":
+            st = m / sqrt_rt
+            start_verbraucht += st
+            for x in range(k, n):
+                soc[x] -= st
+            raus = m
+            marge = sqrt_rt * (imp[k] if t["senke"] == "haus" else ter[k]) - einstand
+            trades.append("Startinhalt %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
+                          % (raus, t["senke"], k, marge * 100))
+        else:
+            s = t["s"]
+            st = m * sqrt_rt
+            if t["art"] == "netz":
+                lad_netz_m[s] += m
+            else:
+                lad_pv_m[s] += m
+            for x in range(s, k):
+                soc[x] += st
+            raus = m * rt
+            kost = imp[s] if t["art"] == "netz" else ter[s]
+            marge = rt * (imp[k] if t["senke"] == "haus" else ter[k]) - kost
+            trades.append("%s %02dh %.2f kWh -> %s %02dh (%.1f ct Marge/kWh)"
+                          % (t["art"], s, m, t["senke"], k, marge * 100))
+        if t["senke"] == "haus":
+            entl_haus[k] += raus
+        else:
+            entl_exp[k] += raus
+
+    eps = 1e-6
+    ok = True
+    if start_verbraucht > max(0.0, soc_start_kwh - boden) + eps:
+        ok = False
+    boden_min = min(boden, soc_start_kwh)
+    for h in range(n):
+        laedt = lad_netz_m[h] + lad_pv_m[h]
+        entl = entl_haus[h] + entl_exp[h]
+        if entl > entl_max + eps or lad_netz_m[h] > lad_netz + eps or laedt > lad_pv + eps:
+            ok = False
+        if laedt > eps and entl > eps:
+            ok = False
+        if lad_pv_m[h] > pv_frei0[h] + eps:
+            ok = False
+        if entl_haus[h] > bedarf0[h] + eps:
+            ok = False
+        # Export erst, wenn der Hausbedarf der Stunde gedeckt ist (nettierender P1)
+        if entl_exp[h] > eps and (bedarf0[h] - entl_haus[h]) > 1e-3:
+            ok = False
+        if soc[h] < boden_min - eps or soc[h] > KAP_KWH + eps:
+            ok = False
+
+    eur = 0.0
+    for h in range(n):
+        bedarf_rest = max(0.0, bedarf0[h] - entl_haus[h])
+        pv_rest = max(0.0, pv_frei0[h] - lad_pv_m[h])
+        eur += (pv_rest + entl_exp[h]) * ter[h] - (bedarf_rest + lad_netz_m[h]) * imp[h]
+    return {"ok": ok, "eur": round(eur, 4), "lad_netz": lad_netz_m, "lad_pv": lad_pv_m,
+            "entl_haus": entl_haus, "entl_exp": entl_exp, "soc": soc,
+            "trades": trades, "struktur": struktur}
+
+
+def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_max_w):
+    # Umschicht-Pass gegen die Greedy-Luecke (Anlass 2026-09-01): Energie, die im
+    # Akku ueber eine teure fruehe Stunde k1 hinweg fuer eine spaetere Stunde k2
+    # gebucht ist, wird bei k1 verkauft und fuer k2 in einer billigen Stunde s
+    # (k1 < s < k2) nachgekauft. Lohnt sich, sobald wert(k1) > kost(s)/rt.
+    # SICHERUNG: jede Umschichtung muss den unabhaengigen Simulator bestehen und
+    # die Bilanz strikt verbessern, sonst bleibt das Greedy-Ergebnis stehen.
+    n = len(netto)
+    sqrt_rt = math.sqrt(rt)
+    entl_max = entl_max_w / 1000.0
+    lad_netz = LADEN_NETZ_MAX_W / 1000.0
+    lad_pv = LADEN_PV_MAX_W / 1000.0
+    bedarf0 = [max(0.0, x) for x in netto]
+
+    basis = simuliere(opt["struktur"], imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w)
+    if not basis["ok"] or abs(basis["eur"] - opt["eur"]) > 1e-3:
+        log("WARNUNG: Simulator weicht vom Greedy ab (%.4f vs %.4f), Umschicht-Pass uebersprungen."
+            % (basis["eur"], opt["eur"]))
+        return opt
+    best = basis
+    umschichtungen = 0
+    verworfen = set()  # an der Simulation gescheiterte Kandidaten (pro Struktur-Stand)
+
+    for _ in range(48):
+        kandidat = None
+        st = best["struktur"]
+        for idx, t in enumerate(st):
+            k2 = t["k"]
+            quelle_ab = 0 if t["art"] == "start" else t["s"]
+            raus_alt = t["meter"] if t["art"] == "start" else t["meter"] * rt
+            if raus_alt < 0.05:
+                continue
+            for k1 in range(quelle_ab, k2):
+                if imp[k1] > 500:
+                    continue
+                entl_rest_k1 = entl_max - (best["entl_haus"][k1] + best["entl_exp"][k1])
+                if entl_rest_k1 < 0.05:
+                    continue
+                bedarf_rest_k1 = max(0.0, bedarf0[k1] - best["entl_haus"][k1])
+                for senke1 in ("haus", "export"):
+                    if senke1 == "haus" and bedarf_rest_k1 < 0.05:
+                        continue
+                    if senke1 == "export" and bedarf_rest_k1 > 1e-3:
+                        continue
+                    wert1 = imp[k1] if senke1 == "haus" else ter[k1]
+                    # Gate fuer das neue fruehe Entladen (gleiche Quelle wie t)
+                    if t["art"] == "start":
+                        m1 = sqrt_rt * wert1 - einstand
+                    else:
+                        m1 = rt * wert1 - (imp[t["s"]] if t["art"] == "netz" else ter[t["s"]])
+                    if m1 <= puffer:
+                        continue
+                    for s in range(k1 + 1, k2):
+                        if imp[s] > 500:
+                            continue
+                        for nach_art in ("netz", "pv"):
+                            if nach_art == "pv":
+                                pv_rest_s = max(0.0, -netto[s]) - best["lad_pv"][s]
+                                if pv_rest_s < 0.05:
+                                    continue
+                                kost = ter[s]
+                                lad_rest = min(lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]), pv_rest_s)
+                            else:
+                                kost = imp[s]
+                                lad_rest = min(lad_netz - best["lad_netz"][s],
+                                               lad_pv - (best["lad_netz"][s] + best["lad_pv"][s]))
+                            if lad_rest < 0.05:
+                                continue
+                            wert2 = imp[k2] if t["senke"] == "haus" else ter[k2]
+                            if rt * wert2 - kost <= puffer:
+                                continue
+                            # Kern-Ungleichung des Dreiecks
+                            gewinn_kwh = wert1 - kost / rt
+                            if gewinn_kwh <= puffer:
+                                continue
+                            raus = min(raus_alt, entl_rest_k1, lad_rest * rt)
+                            if senke1 == "haus":
+                                raus = min(raus, bedarf_rest_k1)
+                            if raus < 0.05:
+                                continue
+                            key = (idx, k1, senke1, s, nach_art)
+                            if key in verworfen:
+                                continue
+                            if kandidat is None or gewinn_kwh * raus > kandidat["gewinn"]:
+                                kandidat = {"idx": idx, "k1": k1, "senke1": senke1,
+                                            "s": s, "nach_art": nach_art, "key": key,
+                                            "raus": raus, "gewinn": gewinn_kwh * raus}
+        if kandidat is None:
+            break
+        t = st[kandidat["idx"]]
+        raus = kandidat["raus"]
+        neu = [dict(x) for x in st]
+        if t["art"] == "start":
+            neu[kandidat["idx"]]["meter"] = t["meter"] - raus
+            neu.append({"art": "start", "s": -1, "k": kandidat["k1"],
+                        "senke": kandidat["senke1"], "meter": raus})
+        else:
+            neu[kandidat["idx"]]["meter"] = t["meter"] - raus / rt
+            neu.append({"art": t["art"], "s": t["s"], "k": kandidat["k1"],
+                        "senke": kandidat["senke1"], "meter": raus / rt})
+        neu.append({"art": kandidat["nach_art"], "s": kandidat["s"], "k": t["k"],
+                    "senke": t["senke"], "meter": raus / rt})
+        probe = simuliere(neu, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w)
+        if not probe["ok"] or probe["eur"] <= best["eur"] + 0.005:
+            verworfen.add(kandidat["key"])
+            continue
+        log("UMSCHICHTUNG: %02dh-Buchung -> Verkauf %02dh (%s) + Nachkauf %02dh (%s), %.2f kWh, +%.2f EUR"
+            % (t["k"], kandidat["k1"], kandidat["senke1"], kandidat["s"],
+               kandidat["nach_art"], raus, probe["eur"] - best["eur"]))
+        best = probe
+        umschichtungen += 1
+        verworfen = set()
+
+    if umschichtungen == 0:
+        return opt
+    best["eur"] = round(best["eur"], 4)
+    return best
 
 
 # ------------------------------------------------------- Plan bauen und pruefen
@@ -663,11 +929,19 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         else:
             netto[h] = round(profil[h] - pv[h], 4)
 
+    if "einstand" not in state:
+        state["einstand"] = float(opts.get("einstand_start", 0.15))
+    einstand = einstand_pflegen(state, cfg, karte, offset)
+
     soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
     soc_start_kwh = KAP_KWH * soc_pct / 100.0
-    opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh,
-                    float(opts.get("einstand_start", 0.15)),
+    opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
                     cfg["rt"], cfg["puffer"], cfg["entl_max_w"])
+    try:
+        opt = verbessere(opt, pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
+                         cfg["rt"], cfg["puffer"], cfg["entl_max_w"])
+    except Exception as e:
+        log("WARNUNG: Umschicht-Pass abgebrochen (%s), Greedy-Plan gilt." % e)
     aktionen = plan_aktionen(opt, ab_stunde, cfg["entl_max_w"])
 
     fehler = pruefe_invarianten(aktionen, opt, pk["fehlt"], ab_stunde, cfg["entl_max_w"], soc_start_kwh)
@@ -678,9 +952,9 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         publiziere_status("fehler", detail)
         return
 
-    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %.1f %%)"
+    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %.1f %%, Einstand %.1f ct)"
         % (anlass, plan_tag.strftime("%Y-%m-%d"), ab_stunde, opt["eur"],
-           len(opt["trades"]), soc_pct))
+           len(opt["trades"]), soc_pct, einstand * 100))
     for t in opt["trades"]:
         log("  " + t)
 
