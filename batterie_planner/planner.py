@@ -1197,6 +1197,27 @@ def publiziere_status(status, detail, eur=None):
         log("WARNUNG: Status-Publish fehlgeschlagen: %s" % e)
 
 
+def vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde):
+    # Stunden vor ab_stunde tragen die Aktion des zuletzt publizierten Plans
+    # desselben Tages statt VORBEI. Befund 2026-09-03 19:31: nach dem
+    # Add-on-Neustart um 19:15 stand die laufende Stunde 19 als VORBEI im
+    # Sensor; der Failsafe hielt die laufende ZWANGSENTLADUNG fuer ungeplant
+    # und raeumte sie ab, Andre stellte sie von Hand wieder her. Der Executor
+    # ist gegen die uebernommenen Aktionen idempotent (prueft den Ist-Zustand).
+    letzter = lade_json(LAST_PLAN_PATH, None)
+    if not letzter or letzter.get("datum") != plan_tag.strftime("%Y-%m-%d"):
+        return aktionen
+    alte = {a["h"]: a for a in letzter.get("stunden", []) if "h" in a}
+    neu = []
+    for a in aktionen:
+        alt = alte.get(a["h"])
+        if a["h"] < ab_stunde and alt and alt.get("aktion") not in (None, "VORBEI"):
+            neu.append({"h": a["h"], "aktion": alt["aktion"], "watt": int(alt.get("watt", 0))})
+        else:
+            neu.append(a)
+    return neu
+
+
 def plan_unveraendert(plan_tag, aktionen, ab_stunde):
     letzter = lade_json(LAST_PLAN_PATH, None)
     if not letzter or letzter.get("datum") != plan_tag.strftime("%Y-%m-%d"):
@@ -1271,6 +1292,7 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         publiziere_status("ok", "%s: Plan unveraendert." % anlass, opt["eur"])
         return
 
+    aktionen = vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde)
     publiziere_plan(plan_tag, aktionen, opt["eur"])
     schreibe_json(LAST_PLAN_PATH, {"datum": plan_tag.strftime("%Y-%m-%d"), "stunden": aktionen})
     aktiv = sum(1 for a in aktionen if a["aktion"] not in ("RUHE", "VORBEI"))

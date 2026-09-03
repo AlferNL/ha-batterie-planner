@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.3 (2026-09-03)
+
+- **Vergangene Stunden behalten ihre Aktion:** beim Publizieren tragen die
+  Stunden vor der Planstunde die Aktion des zuletzt publizierten Plans
+  desselben Tages statt `VORBEI`. Befund 2026-09-03 19:31: nach dem
+  Add-on-Neustart um 19:15 stand die laufende Stunde 19 als VORBEI im
+  Plan-Sensor, der HA-Failsafe (prueft um :31 nur auf ZWANGSLADUNG und
+  ZWANGSENTLADUNG) hielt die laufende, geplante Entladung fuer ungeplant und
+  raeumte sie ab. Der Executor prueft vor jedem Befehl den Ist-Zustand und
+  ist gegen die uebernommenen Aktionen idempotent.
+
 ## 1.3.2 (2026-09-03)
 
 - **Fester Einkaufsaufschlag statt Live-Ableitung:** fuer Stunden ohne
