@@ -202,6 +202,8 @@ def lese_konfig():
     cfg["jahr_kwh"] = zahl("sensor.utilities_p1_meter_teruglevering_contractjaar", 0)
     cfg["belasting"] = zahl("input_number.ne_energiebelasting", 0)
     cfg["verkoop"] = zahl("input_number.ne_verkoopvergoeding", 0)
+    inkoop = zahl("input_number.ne_inkoopvergoeding", -1)
+    cfg["inkoop"] = inkoop if inkoop >= 0 else None
     try:
         cfg["saldering"] = (zustand("input_boolean.ne_saldering_actief")["state"] == "on")
     except Exception:
@@ -256,13 +258,30 @@ def ne_karte():
     return karte
 
 
-def einkaufs_offset(karte):
-    # NaN-Logik der PS-Fassung: ein legitim negativer Live-Preis darf nicht in
-    # den 0.14-Fallback kippen, nur ein fehlender Wert.
+def einkaufs_offset(karte, cfg=None):
+    # Aufschlag auf den Beurs-Preis (inkl. BTW) fuer Stunden ohne NextEnergy-
+    # Stundenpreis (Folgetag): Energiebelasting + Inkoopvergoeding, beides
+    # feste Vertragswerte aus den HA-Helfern (Andre 2026-09-03: "der
+    # Aufschlag ist doch fest konfigurierbar"). Die fruehere Ableitung aus
+    # huidige - Beurs der laufenden Stunde schwankte durch die Cent-Rundung
+    # beider Sensoren um +/-1 ct (0,14 um 05:48, 0,13 um 06:48) und kippte
+    # damit Morgenmargen mit. Die Live-Ableitung bleibt als Plausibilitaets-
+    # pruefung: weicht sie deutlich ab, stimmen die Helfer nicht mehr.
     huidige = zahl("sensor.next_energy_huidige_prijs", float("nan"))
     schluessel = jetzt().strftime("%Y-%m-%d %H")
+    live = None
+    # NaN-Logik der PS-Fassung: ein legitim negativer Live-Preis darf nicht in
+    # den Fallback kippen, nur ein fehlender Wert.
     if (not math.isnan(huidige)) and schluessel in karte:
-        return huidige - karte[schluessel]
+        live = huidige - karte[schluessel]
+    if cfg and cfg.get("inkoop") is not None:
+        fest = cfg["belasting"] + cfg["inkoop"]
+        if live is not None and abs(live - fest) > 0.015:
+            log("WARNUNG: Live-Aufschlag %.3f EUR/kWh (huidige - Beurs) weicht vom konfigurierten %.4f "
+                "(Belasting + Inkoopvergoeding) ab, Helfer pruefen." % (live, fest))
+        return fest
+    if live is not None:
+        return live
     return 0.14
 
 
@@ -1196,7 +1215,7 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     cfg = lese_konfig()
     karte = beurs_karte()
     karte_ne = ne_karte()
-    offset = einkaufs_offset(karte)
+    offset = einkaufs_offset(karte, cfg)
     pk = preis_kurven(plan_tag, karte, offset, cfg, karte_ne)
 
     fehlt_rest = sum(1 for h in range(ab_stunde, 24) if pk["fehlt"][h])

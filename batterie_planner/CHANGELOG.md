@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.2 (2026-09-03)
+
+- **Fester Einkaufsaufschlag statt Live-Ableitung:** fuer Stunden ohne
+  NextEnergy-Stundenpreis (Folgetag) ist der Aufschlag auf den Beurs-Preis
+  jetzt Energiebelasting + Inkoopvergoeding aus den HA-Helfern
+  (`input_number.ne_energiebelasting` + `input_number.ne_inkoopvergoeding`,
+  aktuell 0,1108 + 0,0219 = 0,1327 EUR/kWh). Die bisherige Ableitung aus
+  "huidige Prijs minus Beurs der laufenden Stunde" sprang durch die
+  Cent-Rundung beider Sensoren zwischen 0,12 und 0,14 und kippte am
+  2026-09-03 die Morgenmarge mit. Die Live-Ableitung bleibt als
+  Plausibilitaetspruefung (WARNUNG bei mehr als 1,5 ct Abweichung). Fehlt
+  der Inkoop-Helfer, gilt die alte Live-Ableitung.
+- Restrauschen von +/-1 ct bleibt, weil EnergyZero den Beurs-Preis auf ganze
+  Cent rundet; fuer heutige Stunden nutzt der Planer seit 1.3.1 die
+  NextEnergy-Stundenpreise direkt.
+
 ## 1.3.1 (2026-09-03)
 
 - **Hausprofil aus den Geraetezaehlern der Marstek statt aus den
