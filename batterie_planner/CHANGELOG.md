@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.1 (2026-09-03)
+
+- **Hausprofil aus den Geraetezaehlern der Marstek statt aus den
+  HA-Integrationshelfern:** `tages_profil` rechnet Lade- und Entladeenergie
+  je Stunde jetzt aus `sensor.marstek_venus_modbus_gesamte_ladeenergie` und
+  `..._gesamte_entladeenergie` (Modbus, ticken alle ~60 s in
+  0,01-kWh-Schritten). Die bisherigen Helfer `batterij_ontladen_kwh` und
+  `batterij_laden_uit_net/pv_kwh` sind Riemann-Integratoren ueber eine
+  Leistung, die bei konstanter Ladung stundenlang nicht tickt; sie buchten
+  eine 3,77-kWh-Nachtladung komplett in Stunde 5 und 2,5 kWh Abendentladung
+  in Stunde 22. Im Profil wurde daraus 1,5 kWh Hauslast um 3 und 4 Uhr, 1,3
+  kWh "PV-Ueberschuss" um 5 Uhr und 3 kWh Hauslast um 22 Uhr. Mit dem seit
+  1.3.0 wirksamen 3-Tage-Median haette der Folgetagsplan fuer den 04.09.
+  darauf gebaut (ANTI_FEED um 5 Uhr und 7 Uhr, um Phantom-PV einzulagern).
+- Gecachte Tagesprofile im State werden einmalig verworfen und aus der
+  Recorder-Historie neu gerechnet (`profil_version` 2).
+
 ## 1.3.0 (2026-09-03)
 
 - **Sunk-Cost-Gate im Umschicht-Pass gestrichen:** fuer bereits gespeicherte

@@ -57,10 +57,17 @@ STATUS_TOPIC_BASIS = "brainwiki/batterie/v2planner"
 ZAEHLER = {
     "imp": "sensor.p1_meter_energy_import",
     "exp": "sensor.p1_meter_energy_export",
-    "dis": "sensor.batterij_ontladen_kwh",
-    "lnet": "sensor.batterij_laden_uit_net_kwh",
-    "lpv": "sensor.batterij_laden_uit_pv_kwh",
+    # Batterie-Zaehler des GERAETS (Modbus, ticken alle ~60 s in 0,01-kWh-
+    # Schritten). Die HA-Integrationshelfer (batterij_ontladen_kwh,
+    # batterij_laden_uit_net/pv_kwh) buchen bei konstanter Leistung erst am
+    # Leistungswechsel in einem Schub (Befund 2026-09-03: 3,77 kWh
+    # Nachtladung komplett in Stunde 5, 2,5 kWh Abendentladung in Stunde 22)
+    # und verzerrten das Hausprofil um ganze kWh je Stunde; ein 3-Tage-Median
+    # hielt dann 1,3 kWh "PV" um 5 Uhr morgens fuer real.
+    "dis": "sensor.marstek_venus_modbus_gesamte_entladeenergie",
+    "lad": "sensor.marstek_venus_modbus_gesamte_ladeenergie",
 }
+PROFIL_VERSION = 2  # Zaehlerquelle geaendert: gecachte Tage im State werden neu gerechnet
 
 TZ = None  # wird beim Start aus der HA-Config gesetzt
 
@@ -391,14 +398,13 @@ def tages_profil(tag0):
     imp = deltas(kanten["imp"])
     exp = deltas(kanten["exp"])
     dis = deltas(kanten["dis"])
-    lnet = deltas(kanten["lnet"])
-    lpv = deltas(kanten["lpv"])
+    lad = deltas(kanten["lad"])
     pv_punkte = serie("sensor.solcast_pv_forecast_aktuelle_leistung",
                       tag0, tag0 + timedelta(hours=24))
     pv_ist = integriere_stunden(pv_punkte, tag0)
     haus = [0.0] * 24
     for h in range(24):
-        netto = imp[h] - exp[h] + dis[h] - lnet[h] - lpv[h]
+        netto = imp[h] - exp[h] + dis[h] - lad[h]
         haus[h] = round(netto + pv_ist[h], 4)
     return haus
 
@@ -408,6 +414,13 @@ def profil_auffuellen(state, profil_tage):
     # Recorder haelt ~10 Tage; nicht rechenbare Tage werden als leer markiert.
     heute0 = jetzt().replace(hour=0, minute=0, second=0, microsecond=0)
     neu = 0
+    if state.get("profil_version") != PROFIL_VERSION:
+        if state.get("tage"):
+            log("Profil-Cache verworfen (Zaehlerquelle geaendert, Version %d), Tage werden neu gerechnet."
+                % PROFIL_VERSION)
+        state["tage"] = {}
+        state["profil_version"] = PROFIL_VERSION
+        neu += 1  # Version auch dann persistieren, wenn kein Tag rechenbar ist
     for delta in range(1, min(profil_tage, 10) + 1):
         tag0 = heute0 - timedelta(days=delta)
         key = tag0.strftime("%Y-%m-%d")
