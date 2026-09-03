@@ -588,7 +588,11 @@ def haus_profil(state, profil_tage=None):
 
 
 # ------------------------------------------------------------------ Optimierer
-def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_max_w):
+def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_max_w,
+              export_ok=None):
+    # export_ok: je Stunde True/False, ob Entladung ueber den Hausbedarf hinaus
+    # (Export aus dem Akku) erlaubt ist; None = ueberall erlaubt. Andre
+    # 2026-09-03: Export nur im Zonnebonus-Fenster, sonst Nulleinspeisung.
     # Voll-dynamischer, verlustfreier Stunden-Optimierer (greedy best-pair).
     # 1:1-Port aus batterie_schatten.ps1; Eingaben in Meter-kWh, SoC-Bahn in
     # gespeicherten kWh.
@@ -636,6 +640,8 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
         h_teil = min(bedarf[k], raus_max)
         if h_teil > 1e-6:
             kand.append((h_teil, imp[k]))
+        if export_ok is not None and not export_ok[k]:
+            return kand  # ausserhalb des Bonusfensters: nur Hausbedarf, kein Exportanteil
         if raus_max - h_teil > 1e-6:
             wert = (h_teil * imp[k] + (raus_max - h_teil) * ter[k]) / raus_max
             kand.append((raus_max, wert))
@@ -825,7 +831,8 @@ def simuliere(struktur, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w
             "trades": trades, "struktur": struktur}
 
 
-def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_max_w):
+def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_max_w,
+               export_ok=None):
     # Umschicht-Pass gegen die Greedy-Luecke (Anlass 2026-09-01): Energie, die im
     # Akku ueber eine teure fruehe Stunde k1 hinweg fuer eine spaetere Stunde k2
     # gebucht ist, wird bei k1 verkauft und fuer k2 in einer billigen Stunde s
@@ -906,6 +913,8 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
                                 e_teil = raus - h_teil
                                 if e_teil < 1e-6:
                                     continue  # identisch mit Variante "haus"
+                                if export_ok is not None and not export_ok[k1]:
+                                    continue  # kein Export ausserhalb des Bonusfensters
                                 wert1 = (h_teil * imp[k1] + e_teil * ter[k1]) / raus
                             # Gate fuer das neue fruehe Entladen: nur fuer noch
                             # NICHT gekaufte Ware (netz/pv-Quelle) muss der
@@ -1081,6 +1090,32 @@ def _selbsttest_kern():
         elif entl7 > 1e-6:
             fehler.append("Szenario 2b: Stunde 7 verkauft ohne billigen Nachkauf "
                           "(%.2f kWh), Abendreserve geht verloren." % entl7)
+
+    # Szenario 3 (1.3.4): Export nur im Bonusfenster 06-22. Abend des
+    # 2026-09-03 (Einstand 26,3 ct, Akku 62 % ab 21 Uhr): mit Fenster darf in
+    # Stunde 22/23 nichts exportiert werden, der Hausbedarf wird weiter
+    # gedeckt (ohne Fenster plante 1.3.3 einen 800-W-Block mit Exportanteil).
+    einstand3 = 0.263
+    imp3 = [x + 0.1327 for x in beurs2]
+    ter3 = [wert_terug(beurs2[h], h, cfg) for h in range(24)]
+    netto3 = [0.0] * 24
+    netto3[21], netto3[22], netto3[23] = 0.82, 0.72, 0.67
+    for h in range(21):
+        imp3[h] = 999.0
+        ter3[h] = -999.0
+    soc3 = 0.62 * KAP_KWH
+    fenster = [6 <= h < 22 for h in range(24)]
+    opt3 = optimiere(imp3, ter3, netto3, soc3, einstand3, rt, puffer, 800, fenster)
+    fein3 = verbessere(opt3, imp3, ter3, netto3, soc3, einstand3, rt, puffer, 800, fenster)
+    sim3 = simuliere(fein3["struktur"], imp3, ter3, netto3, soc3, einstand3, rt, 800)
+    if not sim3["ok"]:
+        fehler.append("Szenario 3: Simulator lehnt den Plan ab.")
+    for h in (22, 23):
+        if sim3["entl_exp"][h] > 1e-6:
+            fehler.append("Szenario 3: Export in Stunde %d trotz Bonusfenster-Ende (%.2f kWh)."
+                          % (h, sim3["entl_exp"][h]))
+    if sim3["entl_haus"][22] < min(0.8, netto3[22]) - 1e-6:
+        fehler.append("Szenario 3: Hausbedarf 22h nicht gedeckt (%.2f kWh)." % sim3["entl_haus"][22])
     return fehler
 
 
@@ -1264,11 +1299,14 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
 
     soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
     soc_start_kwh = KAP_KWH * soc_pct / 100.0
+    # Export aus dem Akku nur im Zonnebonus-Fenster (Andre 2026-09-03), sonst
+    # deckt die Entladung nur den Hausbedarf (anti_feed = Nulleinspeisung).
+    export_ok = [cfg["venster_von"] <= h < cfg["venster_bis"] for h in range(24)]
     opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
-                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"])
+                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
     try:
         opt = verbessere(opt, pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
-                         cfg["rt"], cfg["puffer"], cfg["entl_max_w"])
+                         cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
     except Exception as e:
         log("WARNUNG: Umschicht-Pass abgebrochen (%s), Greedy-Plan gilt." % e)
     aktionen = plan_aktionen(opt, ab_stunde, cfg["entl_max_w"])

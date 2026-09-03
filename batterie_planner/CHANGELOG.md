@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.4 (2026-09-03)
+
+- **Export aus dem Akku nur im Zonnebonus-Fenster** (`ne_zonnebonus_start`
+  bis `ne_zonnebonus_ende`, aktuell 06 bis 22 Uhr). Ausserhalb bekommt eine
+  Entladestunde nur noch den Hausbedarf (Nulleinspeisung, Aktion
+  `ANTI_FEED`), Greedy und Umschicht-Pass bilden dort keinen Exportblock.
+  Anlass 2026-09-03 22 Uhr: 800-W-Block mit 0,08 kWh geplantem Export zu
+  33 ct (Beurs + Belasting unter Saldering), real 150 W ins Netz. Unter
+  Saldering rechnerisch ein Nullsummenspiel gegen den Hausverbrauch um 23
+  Uhr, aber Andres Regel: gespeicherte Ware geht ohne Bonus nicht ins Netz.
+  Selbsttest-Szenario 3 sichert die Regel.
+
 ## 1.3.3 (2026-09-03)
 
 - **Vergangene Stunden behalten ihre Aktion:** beim Publizieren tragen die
