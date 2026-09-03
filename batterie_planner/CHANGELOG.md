@@ -16,6 +16,24 @@
   darauf gebaut (ANTI_FEED um 5 Uhr und 7 Uhr, um Phantom-PV einzulagern).
 - Gecachte Tagesprofile im State werden einmalig verworfen und aus der
   Recorder-Historie neu gerechnet (`profil_version` 2).
+- **Einstand lag-frei und stundengenau:** der Zugang seit dem letzten Lauf
+  wird aus den Live-Leistungssensoren `batterij_laden_uit_net_w` /
+  `_pv_w` je Kalenderstunde integriert und mit dem Preis SEINER Stunde
+  bewertet. Vorher lieferten die kWh-Helfer den Zugang um Stunden verspaetet
+  in einem Schub, der mit dem Preis der Fenster-Mitte bewertet wurde,
+  waehrend der Snapshot-SoC die Ware schon enthielt (doppelte Gewichtung).
+  Befund 2026-09-03: Einstand nach der Nachtladung erst zu niedrig (31,6 ct,
+  Stunde-3-Ware als Altbestand zum Vortagspreis), dann Sprung auf 33,4 ct
+  um 06:48 mit dem Preis der Stunde 6 fuer Ware aus den Stunden 4 und 5.
+  Ein zu langes Fenster (> 3 h, z.B. nach Ausfall) wird jetzt als WARNUNG
+  gemeldet statt still verworfen; bei HA-API-Fehler bleibt das Fenster offen.
+- **Einkaufspreis je Stunde aus NextEnergy** (`hourly_prices` des Sensors
+  `next_energy_huidige_prijs`), solange die Stunde dort vorliegt (heute);
+  sonst wie bisher Beurs + Aufschlag der laufenden Stunde (Folgetag). Der
+  eine Aufschlag rundete je Stunde um +/-1 ct daneben und kippte am
+  2026-09-03 die 07h-Marge mit (0,14 um 05:48, 0,13 um 06:48).
+- Selbsttest laeuft still (keine Phantom-UMSCHICHTUNG-Zeilen im Log beim
+  Start) und nennt die drei Szenarien statt einer alten Versionsnummer.
 
 ## 1.3.0 (2026-09-03)
 

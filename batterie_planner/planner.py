@@ -236,6 +236,26 @@ def beurs_karte():
     return karte
 
 
+def ne_karte():
+    # NextEnergy-Stundenpreise (all-in, EUR/kWh) des laufenden Tages aus dem
+    # Attribut hourly_prices, Schluessel wie in beurs_karte(). Liegt fuer eine
+    # Stunde ein Wert vor, ersetzt er "Beurs + Aufschlag der laufenden Stunde":
+    # der eine Aufschlag rundete je Stunde um +/-1 ct daneben (Befund
+    # 2026-09-03: 0,14 um 05:48, 0,13 um 06:48, die Morgenmarge kippte mit).
+    karte = {}
+    try:
+        eintraege = zustand("sensor.next_energy_huidige_prijs")["attributes"].get("hourly_prices") or []
+    except Exception:
+        return karte
+    for p in eintraege:
+        try:
+            t = parse_iso(p["start"])
+            karte[t.strftime("%Y-%m-%d %H")] = float(p["eur_kwh"])
+        except (ValueError, TypeError, KeyError):
+            continue
+    return karte
+
+
 def einkaufs_offset(karte):
     # NaN-Logik der PS-Fassung: ein legitim negativer Live-Preis darf nicht in
     # den 0.14-Fallback kippen, nur ein fehlender Wert.
@@ -255,9 +275,10 @@ def wert_terug(beurs_wert, h, cfg):
     return round(beurs_wert - cfg["verkoop"] + bonus + bel, 4)
 
 
-def preis_kurven(tag0, karte, offset, cfg):
+def preis_kurven(tag0, karte, offset, cfg, karte_ne=None):
     # imp/ter je Stunde; fehlende Beurs-Stunden werden mit Sperr-Preisen
     # (999/-999) vom Handel ausgeschlossen statt als Phantom-0 gerechnet.
+    # imp: NextEnergy-Stundenpreis wenn vorhanden (heute), sonst Beurs+Aufschlag.
     imp = [0.0] * 24
     ter = [0.0] * 24
     beurs = [0.0] * 24
@@ -271,28 +292,85 @@ def preis_kurven(tag0, karte, offset, cfg):
             ter[h] = -999.0
             continue
         beurs[h] = karte[key]
-        imp[h] = beurs[h] + offset
+        imp[h] = preis_import(key, karte, offset, karte_ne, beurs[h] + offset)
         ter[h] = wert_terug(beurs[h], h, cfg)
     return {"imp": imp, "ter": ter, "beurs": beurs, "fehlt": fehlt}
 
 
-def einstand_pflegen(state, cfg, karte, offset):
+W_LADEN_NETZ = "sensor.batterij_laden_uit_net_w"
+W_LADEN_PV = "sensor.batterij_laden_uit_pv_w"
+
+
+def integriere_fenster(punkte, von, bis):
+    # Zeitgewichtete Integration einer W-Stufenkurve ueber ein beliebiges
+    # Fenster, Ergebnis je Kalenderstunde ("YYYY-MM-DD HH" -> kWh). Gleiche
+    # Stufenlogik wie integriere_stunden, nur mit freien Fenstergrenzen.
+    kwh = {}
+    if not punkte:
+        return kwh
+    start = von.replace(minute=0, second=0, microsecond=0)
+    while start < bis:
+        a = max(start, von)
+        b = min(start + timedelta(hours=1), bis)
+        wert = None
+        for (t, v) in punkte:
+            if t <= a:
+                wert = v
+            else:
+                break
+        t0 = a
+        summe_wh = 0.0
+        for (t, v) in punkte:
+            if t <= a:
+                continue
+            if t >= b:
+                break
+            if wert is not None:
+                summe_wh += wert * (t - t0).total_seconds() / 3600.0
+            t0 = t
+            wert = v
+        if wert is not None:
+            summe_wh += wert * (b - t0).total_seconds() / 3600.0
+        if summe_wh > 0:
+            kwh[start.strftime("%Y-%m-%d %H")] = summe_wh / 1000.0
+        start += timedelta(hours=1)
+    return kwh
+
+
+def preis_import(key, karte, offset, karte_ne, fallback):
+    # Einkaufspreis einer Kalenderstunde (EUR/kWh all-in): NextEnergy-
+    # Stundenpreis, wenn vorhanden; sonst Beurs + Aufschlag; sonst Fallback.
+    if karte_ne and key in karte_ne:
+        return karte_ne[key]
+    if key in karte:
+        return karte[key] + offset
+    return fallback
+
+
+def einstand_pflegen(state, cfg, karte, offset, karte_ne=None):
     # Fuehrt den ECHTEN gewichteten Einkaufspreis der gespeicherten Energie im
     # State mit (statt der 15-ct-Konstante, Befund 2026-09-01: die 04:00-Ladung
-    # zu 32 ct all-in wurde ab 04:55 als 15-ct-Ware verplant). Quelle sind die
-    # kumulativen Ladezaehler seit dem letzten Lauf; Netzladung kostet imp der
-    # Stunde, PV-Ladung ihre Export-Opportunitaet (ter). Entladung aendert den
-    # Durchschnittspreis nicht. Einheit: EUR je GESPEICHERTER kWh.
+    # zu 32 ct all-in wurde ab 04:55 als 15-ct-Ware verplant). Netzladung
+    # kostet den Einkaufspreis ihrer Stunde, PV-Ladung ihre Export-
+    # Opportunitaet (ter). Entladung aendert den Durchschnittspreis nicht.
+    # Einheit: EUR je GESPEICHERTER kWh.
+    #
+    # 1.3.1: Zugang seit dem letzten Lauf wird aus den LIVE-Leistungssensoren
+    # je Kalenderstunde integriert und je Stunde bepreist. Die frueheren
+    # kWh-Integrationshelfer tickten bei konstanter Ladung stundenlang nicht
+    # und buchten dann alles in einem Schub (Befund 2026-09-03: 1,59 kWh der
+    # Stunden 4/5 kamen um 06:01, wurden mit dem Preis der Fenster-Mitte
+    # Stunde 6 bewertet, und der Snapshot-SoC enthielt die Ware schon, also
+    # doppelt gewichtet; vorher war der Einstand um 04:48 zu niedrig, weil
+    # 1,4 kWh frische Stunde-3-Ware als Altbestand zum Vortagspreis galten).
     sqrt_rt = math.sqrt(cfg["rt"])
     boden = KAP_KWH * BODEN_PCT / 100.0
     soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", -1)
-    lnet = zahl("sensor.batterij_laden_uit_net_kwh", -1)
-    lpv = zahl("sensor.batterij_laden_uit_pv_kwh", -1)
     einstand = float(state.get("einstand", -1))
     if einstand < 0:
         einstand = float(state.get("einstand_start_fallback", 0.15))
-    if soc_pct < 0 or lnet < 0 or lpv < 0:
-        log("WARNUNG: Einstand-Update uebersprungen (Sensor nicht lesbar), bleibe bei %.1f ct." % (einstand * 100))
+    if soc_pct < 0:
+        log("WARNUNG: Einstand-Update uebersprungen (SoC nicht lesbar), bleibe bei %.1f ct." % (einstand * 100))
         return einstand
 
     nun = jetzt()
@@ -301,14 +379,25 @@ def einstand_pflegen(state, cfg, karte, offset):
         try:
             alt_zeit = datetime.fromisoformat(snap["zeit"])
             dt_h = (nun - alt_zeit).total_seconds() / 3600.0
-            dn = min(6.0, max(0.0, lnet - float(snap["lnet"])))
-            dp = min(6.0, max(0.0, lpv - float(snap["lpv"])))
-            if 0 < dt_h <= 3 and (dn + dp) > 0.02:
-                mitte = alt_zeit + (nun - alt_zeit) / 2
-                key = mitte.strftime("%Y-%m-%d %H")
-                if key in karte:
-                    beurs_h = karte[key]
-                    kost = dn * (beurs_h + offset) + dp * wert_terug(beurs_h, mitte.hour, cfg)
+            if dt_h > 3:
+                log("WARNUNG: Einstand-Fenster %.1f h zu lang (seit %s), Zugang darin bleibt unbewertet."
+                    % (dt_h, snap["zeit"]))
+            elif dt_h > 0:
+                netz_h = integriere_fenster(serie(W_LADEN_NETZ, alt_zeit, nun), alt_zeit, nun)
+                pv_h = integriere_fenster(serie(W_LADEN_PV, alt_zeit, nun), alt_zeit, nun)
+                dn = min(6.0, sum(netz_h.values()))
+                dp = min(6.0, sum(pv_h.values()))
+                if (dn + dp) > 0.02:
+                    huidige = zahl("sensor.next_energy_huidige_prijs", float("nan"))
+                    fallback = huidige if not math.isnan(huidige) else 0.30
+                    kost = 0.0
+                    for key, kwh in netz_h.items():
+                        kost += kwh * preis_import(key, karte, offset, karte_ne, fallback)
+                    for key, kwh in pv_h.items():
+                        beurs_h = karte.get(key)
+                        if beurs_h is None:
+                            beurs_h = max(0.0, fallback - offset)
+                        kost += kwh * wert_terug(beurs_h, int(key[-2:]), cfg)
                     e_alt = max(0.0, KAP_KWH * float(snap["soc"]) / 100.0 - boden)
                     zugang = (dn + dp) * sqrt_rt
                     if e_alt < 0.05:
@@ -316,11 +405,17 @@ def einstand_pflegen(state, cfg, karte, offset):
                     else:
                         einstand = (e_alt * einstand + kost) / (e_alt + zugang)
                     einstand = min(1.5, max(0.0, einstand))
-                    log("Einstand aktualisiert: %.1f ct/kWh (Zugang %.2f kWh Netz / %.2f kWh PV)"
-                        % (einstand * 100, dn, dp))
+                    stunden = ", ".join(k[-2:] + "h" for k in sorted(set(list(netz_h) + list(pv_h))))
+                    log("Einstand aktualisiert: %.1f ct/kWh (Zugang %.2f kWh Netz / %.2f kWh PV, Stunden %s)"
+                        % (einstand * 100, dn, dp, stunden))
         except (ValueError, KeyError, TypeError) as e:
             log("WARNUNG: Einstand-Snapshot unlesbar (%s), setze neu auf." % e)
-    state["einstand_snap"] = {"zeit": nun.isoformat(), "lnet": lnet, "lpv": lpv, "soc": soc_pct}
+        except Exception as e:
+            # HA-API nicht erreichbar: Fenster offen lassen, der naechste Lauf
+            # holt den Zugang nach (bis zur 3-h-Grenze).
+            log("WARNUNG: Einstand-Update uebersprungen (%s), Fenster bleibt offen." % e)
+            return einstand
+    state["einstand_snap"] = {"zeit": nun.isoformat(), "soc": soc_pct}
     state["einstand"] = round(einstand, 4)
     try:
         schreibe_json(STATE_PATH, state)
@@ -864,7 +959,7 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
     return best
 
 
-def selbsttest():
+def _selbsttest_kern():
     # Regressions-Selbsttest beim Start (rein lokal, ohne HA/Netz, < 1 s):
     # das 08:55-Szenario vom 2026-09-01, bei dem die alte haus/export-Trennung
     # die beste Stunde 9 (kleiner Rest-Hausbedarf 0.14 kWh) leer ausgehen
@@ -968,6 +1063,19 @@ def selbsttest():
             fehler.append("Szenario 2b: Stunde 7 verkauft ohne billigen Nachkauf "
                           "(%.2f kWh), Abendreserve geht verloren." % entl7)
     return fehler
+
+
+def selbsttest():
+    # Laeuft STILL: die Trade- und UMSCHICHTUNG-Zeilen der Testszenarien
+    # gehoeren nicht ins Betriebslog (Befund 2026-09-03: fuenf Phantom-
+    # Umschichtungen beim Start sahen aus wie ein echter Planlauf).
+    global log
+    echt = log
+    log = lambda text: None
+    try:
+        return _selbsttest_kern()
+    finally:
+        log = echt
 
 
 # ------------------------------------------------------- Plan bauen und pruefen
@@ -1087,8 +1195,9 @@ def plan_unveraendert(plan_tag, aktionen, ab_stunde):
 def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, anlass):
     cfg = lese_konfig()
     karte = beurs_karte()
+    karte_ne = ne_karte()
     offset = einkaufs_offset(karte)
-    pk = preis_kurven(plan_tag, karte, offset, cfg)
+    pk = preis_kurven(plan_tag, karte, offset, cfg, karte_ne)
 
     fehlt_rest = sum(1 for h in range(ab_stunde, 24) if pk["fehlt"][h])
     if fehlt_rest > 0:
@@ -1111,7 +1220,7 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
 
     if "einstand" not in state:
         state["einstand"] = float(opts.get("einstand_start", 0.15))
-    einstand = einstand_pflegen(state, cfg, karte, offset)
+    einstand = einstand_pflegen(state, cfg, karte, offset, karte_ne)
 
     soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
     soc_start_kwh = KAP_KWH * soc_pct / 100.0
@@ -1185,7 +1294,7 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (Block-Bewertung 1.2.0).")
+    log("Selbsttest bestanden (3 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne billigen Nachkauf).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
