@@ -433,15 +433,24 @@ def profil_auffuellen(state, profil_tage):
     return state
 
 
-def haus_profil(state):
-    # Median je Stunde ueber die gesammelten Tage; Notnagel 350 W Grundlast.
+def haus_profil(state, profil_tage=None):
+    # Median je Stunde ueber die juengsten `profil_tage` Tage MIT Daten;
+    # Notnagel 350 W Grundlast. Befund 2026-09-03: profil_auffuellen behaelt
+    # profil_tage + 6 Tage als Vorrat, der Median lief aber ueber ALLE
+    # behaltenen Tage (Einstellung 3 wirkte als 9-Tage-Median).
     profil = [0.35] * 24
+    tage = []
+    for key in sorted(state["tage"].keys(), reverse=True):
+        eintrag = state["tage"][key]
+        if eintrag.get("haus") is None:
+            continue
+        tage.append(eintrag)
+        if profil_tage and len(tage) >= int(profil_tage):
+            break
     for h in range(24):
         werte = []
-        for eintrag in state["tage"].values():
-            haus = eintrag.get("haus")
-            if haus is None:
-                continue
+        for eintrag in tage:
+            haus = eintrag["haus"]
             anz = int(eintrag.get("stunden", 24))
             if h < anz:
                 werte.append(float(haus[h]))
@@ -771,13 +780,21 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
                                 if e_teil < 1e-6:
                                     continue  # identisch mit Variante "haus"
                                 wert1 = (h_teil * imp[k1] + e_teil * ter[k1]) / raus
-                            # Gate fuer das neue fruehe Entladen (gleiche Quelle wie t)
-                            if t["art"] == "start":
-                                m1 = sqrt_rt * wert1 - einstand
-                            else:
+                            # Gate fuer das neue fruehe Entladen: nur fuer noch
+                            # NICHT gekaufte Ware (netz/pv-Quelle) muss der
+                            # Verkauf ueber dem Einkauf liegen. Startinhalt ist
+                            # bezahlt (Sunk Cost); sein Massstab ist allein der
+                            # Nachkauf in s, den die Kern-Ungleichung unten
+                            # prueft. Befund 2026-09-03: das alte Einstand-Gate
+                            # (sqrt_rt*wert1 - einstand > puffer) blockte bei
+                            # 33,4 ct Einstand das Dreieck "07h zu 36 ct
+                            # verkaufen, 14h zu 17 ct nachkaufen" (+16 ct/kWh);
+                            # Stunden 7 und 8 blieben RUHE, ~1 kWh lag den
+                            # Tag ueber ungenutzt im Akku.
+                            if t["art"] != "start":
                                 m1 = rt * wert1 - (imp[t["s"]] if t["art"] == "netz" else ter[t["s"]])
-                            if m1 <= puffer:
-                                continue
+                                if m1 <= puffer:
+                                    continue
                             # Kern-Ungleichung des Dreiecks
                             gewinn_kwh = wert1 - kost / rt
                             if gewinn_kwh <= puffer:
@@ -884,6 +901,59 @@ def selbsttest():
     for h in range(24):
         if sim["entl_haus"][h] + sim["entl_exp"][h] > 0.8 + 1e-6:
             fehler.append("Stunde %d ueber 800 W." % h)
+
+    # Szenario 2 (1.3.0): der 06:48-Lauf vom 2026-09-03. Einstand 33,4 ct
+    # liegt ueber dem Morgenwert (36 ct * sqrt(rt) = 33,2 ct), der Greedy
+    # bucht 07h darum nicht; der Umschicht-Pass muss das Dreieck trotzdem
+    # fahren (07h verkaufen, 14h zu 17 ct nachkaufen), weil der Einstand
+    # bezahlt ist. Gegenprobe 2b: ist KEINE spaetere Stunde billiger als der
+    # Morgenwert (imp/rt ueberall ueber 36 ct), darf nicht verkauft werden
+    # (Kern-Ungleichung), sonst geht die Abendreserve verloren.
+    einstand2 = 0.334
+    beurs2 = [0.22, 0.21, 0.19, 0.17, 0.17, 0.17, 0.21, 0.23, 0.22, 0.18, 0.15,
+              0.11, 0.06, 0.04, 0.04, 0.04, 0.08, 0.15, 0.22, 0.27, 0.27, 0.24,
+              0.22, 0.21]
+    netto2 = [0.0] * 24
+    for h, w in ((7, 0.74), (8, 0.65), (9, 0.30), (10, 0.10), (11, -0.30),
+                 (12, -0.80), (13, -1.0), (14, -1.2), (15, -1.4), (16, -1.3),
+                 (17, -0.9), (18, 0.0), (19, 0.49), (20, 0.65), (21, 0.14),
+                 (22, 0.94), (23, 0.30)):
+        netto2[h] = w
+    soc2 = 0.60 * KAP_KWH
+    for variante, mittag in (("2", None), ("2b", 0.19)):
+        b = list(beurs2)
+        if mittag is not None:
+            for h in range(8, 24):
+                b[h] = max(b[h], mittag)  # imp >= 0.32, imp/rt >= 0.376 > 0.36
+        imp2 = [x + 0.13 for x in b]
+        ter2 = [wert_terug(b[h], h, cfg) for h in range(24)]
+        for h in range(7):
+            imp2[h] = 999.0
+            ter2[h] = -999.0
+        opt2 = optimiere(imp2, ter2, netto2, soc2, einstand2, rt, puffer, 800)
+        fein2 = verbessere(opt2, imp2, ter2, netto2, soc2, einstand2, rt, puffer, 800)
+        sim2 = simuliere(fein2["struktur"], imp2, ter2, netto2, soc2, einstand2, rt, 800)
+        entl7 = sim2["entl_haus"][7] + sim2["entl_exp"][7]
+        if not sim2["ok"]:
+            fehler.append("Szenario %s: Simulator lehnt den Plan ab." % variante)
+        if abs(sim2["eur"] - fein2["eur"]) > 0.005:
+            fehler.append("Szenario %s: Simulator-Bilanz weicht ab (%.4f vs %.4f)."
+                          % (variante, sim2["eur"], fein2["eur"]))
+        if fein2["eur"] < opt2["eur"] - 1e-6:
+            fehler.append("Szenario %s: Umschicht-Pass verschlechtert die Bilanz." % variante)
+        for h in range(24):
+            if sim2["entl_haus"][h] + sim2["entl_exp"][h] > 0.8 + 1e-6:
+                fehler.append("Szenario %s: Stunde %d ueber 800 W." % (variante, h))
+        if mittag is None:
+            if entl7 < 0.5:
+                fehler.append("Szenario 2: Stunde 7 bleibt trotz billigem Mittag leer "
+                              "(%.2f kWh), Sunk-Cost-Gate wirkt noch." % entl7)
+            if fein2["eur"] < opt2["eur"] + 0.05:
+                fehler.append("Szenario 2: Umschicht-Pass bringt keinen Gewinn (%.4f vs %.4f)."
+                              % (fein2["eur"], opt2["eur"]))
+        elif entl7 > 1e-6:
+            fehler.append("Szenario 2b: Stunde 7 verkauft ohne billigen Nachkauf "
+                          "(%.2f kWh), Abendreserve geht verloren." % entl7)
     return fehler
 
 
@@ -1015,7 +1085,7 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         publiziere_status("warnung", detail)
         return
 
-    profil = haus_profil(state)
+    profil = haus_profil(state, int(opts.get("profil_tage", 14)))
     pv = solcast_stunden(pv_entity, plan_tag, pv_feld)
     netto = [0.0] * 24
     for h in range(24):

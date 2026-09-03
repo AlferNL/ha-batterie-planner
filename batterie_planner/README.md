@@ -19,5 +19,5 @@ Stuendlicher Batterie-Fahrplan (rolling horizon) fuer die Marstek-v2-Steuerung.
 | Option | Default | Bedeutung |
 |---|---|---|
 | `einstand_start` | 0.15 | EUR/kWh Startwert; danach fuehrt das Add-on den echten gewichteten Einkaufspreis der gespeicherten Energie selbst im State mit |
-| `profil_tage` | 14 | Tage im Median-Hauslastprofil |
+| `profil_tage` | 14 | Tage im Median-Hauslastprofil (die juengsten Tage mit Daten; 6 weitere bleiben nur als Vorrat im State) |
 | `takt_minute` | 55 | Minute des stuendlichen Planungslaufs |

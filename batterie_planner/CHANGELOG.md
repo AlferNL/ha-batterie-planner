@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.0 (2026-09-03)
+
+- **Sunk-Cost-Gate im Umschicht-Pass gestrichen:** fuer bereits gespeicherte
+  Ware (Startinhalt) verlangte der Pass bisher, dass der fruehe Verkauf ueber
+  dem historischen Einstand liegt, bevor er das Dreieck (frueh verkaufen,
+  spaeter billig nachkaufen) ueberhaupt bewertete. Der Einstand ist aber
+  bezahlt; der einzige Massstab ist der Nachkaufpreis, den die
+  Kern-Ungleichung (wert(k1) > kost(s)/rt + puffer) samt Voll-Simulator und
+  Strikt-Besser-Regel weiterhin prueft. Fuer noch nicht gekaufte Ware
+  (netz/pv-Quelle) bleibt das Gate. Befund 2026-09-03: nach der Nachtladung
+  sprang der Einstand um 06:48 auf 33,4 ct (Ladezaehler buchte zwei Stunden
+  in einem Schub nach), die Morgenbloecke 07h/08h zu 36 ct fielen unter die
+  1-ct-Schwelle, das Gate blockte den Verkauf mit Nachkauf um 14 Uhr zu
+  17 ct (+16 ct/kWh), der Akku stand ab 07:01 den Tag ueber mit ~1 kWh
+  ungenutzt in Ruhe. Replay des 06:48-Laufs mit Fix: +0,22 EUR. Hinweis
+  zum Log: die Marge in einer `Startinhalt ... -> haus 07h (x ct)`-Zeile
+  bleibt relativ zum Einstand gerechnet und kann nach einer Umschichtung
+  negativ stehen; der echte Gewinn des Zuges steht in der
+  `UMSCHICHTUNG`-Zeile (Verkauf minus Nachkauf).
+- **`profil_tage` wirkt jetzt wie beschriftet:** der Median laeuft nur noch
+  ueber die juengsten `profil_tage` Tage mit Daten. Bisher behielt der State
+  `profil_tage + 6` Tage als Vorrat und der Median lief ueber alle, die
+  Einstellung 3 war faktisch ein 9-Tage-Median.
+- **Selbsttest um das Sunk-Cost-Szenario erweitert** (06:48-Lauf vom
+  2026-09-03): der Umschicht-Pass muss die Morgenstunde trotz Einstand ueber
+  dem Morgenpreis bedienen, und kein Verkauf darf unter den Nachkaufkosten
+  liegen.
+
 ## 1.2.0 (2026-09-01)
 
 - **Block-Bewertung statt haus/export-Trennung:** Greedy und Umschicht-Pass
