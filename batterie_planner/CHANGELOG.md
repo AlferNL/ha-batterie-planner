@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.3.5 (2026-09-04)
+
+- **Halte-Schwelle fuer Startinhalt vom Einstand geloest:** der Greedy mass
+  gespeicherte Ware bisher am historischen Einstand, obwohl der bezahlt ist
+  (Sunk Cost). Unter Saldering fiel das kaum auf, weil der um 11 ct hoehere
+  Exportwert fast immer eine Abend-Ankerbuchung lieferte, die der
+  Umschicht-Pass (1.3.0) nach vorn zog. Replay 2026-09-04 des 06:48-Laufs vom
+  03.09. OHNE Saldering (Einstand 33,4 ct, SoC 60 %): kein einziger
+  Startinhalt-Trade, 2,44 kWh lagen den ganzen Tag ungenutzt im Akku,
+  waehrend das Haus morgens zu 36 ct aus dem Netz lief (-0,25 EUR statt
+  moeglicher +1,07 EUR). Neu: `reservationswert()` = Wert einer gespeicherten
+  kWh ueber den Horizont hinaus, gedeckelt durch die beste Stunde des
+  Referenztags und den billigsten Nachkauf dort; Referenz ist der Folgetag,
+  sobald seine Beurs-Kurve da ist (ab ~13 Uhr), sonst der geplante Tag mit
+  voller Kurve. `optimiere()` nimmt die Schwelle als `reservation`; ohne
+  Angabe gilt weiter der Einstand (nur noch im Selbsttest als Referenz). Die
+  Log-Zeile nennt Schwelle und Quelle (`Halte-Schwelle 18.8 ct aus Folgetag`).
+- **Selbsttest um die Welt ohne Saldering erweitert** (Szenario 4 und 4b):
+  Morgenstunde 7 muss bedient und der Akku am Tagesende leer sein, die
+  Halte-Schwelle muss gegen das alte Einstand-Gate mindestens 5 ct bringen;
+  Gegenprobe 4b (kein billiger Nachkauf) darf die Morgenstunde nicht
+  verkaufen. Bis 1.3.4 war die AUS-Welt durch keinen Regressionsfall
+  abgesichert (der Selbsttest liest den HA-Schalter nie).
+- **Regime-Kennzeichen:** Plan-Payload (`saldering`), Status-Attribute und
+  `last_plan.json` tragen, in welchem Abrechnungsmodell der Plan entstand.
+  Ein Wechsel des Schalters publiziert den Plan auch dann, wenn die Aktionen
+  gleich bleiben (Flatter-Bremse prueft das Regime mit).
+- **Rueckfall bei unlesbarem Schalter nach Kalender** (`jetzt().year < 2027`)
+  statt still `True`, mit WARNUNG im Log.
+- Befund zur Einordnung (Replay 2026-09-04, Harness validiert gegen die
+  Add-on-Logs): der Schalter wirkt im Planer an genau einer Stelle
+  (`wert_terug`, minus 0,1108 EUR/kWh Teruglever-Wert). Ohne Saldering
+  stirbt der Morgen-Export aus der Nachtladung, PV-Ueberschuss wird zur
+  bevorzugten Ladequelle, der Kipp-Punkt Export gegen Eigenverbrauch wandert
+  von 4 auf 27 ct Beurs. In der echten Saldering-Welt kostet ein vorzeitiges
+  Umschalten Cent pro Tag, nicht Euro.
+
 ## 1.3.4 (2026-09-03)
 
 - **Export aus dem Akku nur im Zonnebonus-Fenster** (`ne_zonnebonus_start`

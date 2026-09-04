@@ -207,7 +207,11 @@ def lese_konfig():
     try:
         cfg["saldering"] = (zustand("input_boolean.ne_saldering_actief")["state"] == "on")
     except Exception:
-        cfg["saldering"] = True
+        # Helfer nicht lesbar: Rueckfall nach Kalender (Saldering endet am
+        # 31.12.2026), und zwar laut, damit ein geloeschter Helfer auffaellt.
+        cfg["saldering"] = jetzt().year < 2027
+        log("WARNUNG: input_boolean.ne_saldering_actief nicht lesbar, nehme Saldering=%s (Kalender)."
+            % cfg["saldering"])
     cfg["rt"] = zahl("input_number.gate_rt_wirkungsgrad", 84) / 100.0
     cfg["puffer"] = zahl("input_number.gate_puffer", 0.01)
     entl_ha = zahl("number.marstek_venus_modbus_maximale_entladeleistung", 800)
@@ -588,11 +592,43 @@ def haus_profil(state, profil_tage=None):
 
 
 # ------------------------------------------------------------------ Optimierer
+def reservationswert(pk, cfg, export_ok):
+    # Wert einer GESPEICHERTEN kWh ueber den Planhorizont hinaus (1.3.5), EUR/kWh.
+    # Der Einstand ist bezahlt (Sunk Cost) und taugt nicht als Verkaufsgrenze:
+    # unter Saldering lieferte der um 11 ct hoehere Exportwert fast immer eine
+    # Abend-Ankerbuchung, die der Umschicht-Pass nach vorn zog; ohne Saldering
+    # (Replay 2026-09-04 des 06:48-Laufs vom 03.09., Einstand 33,4 ct) blieben
+    # 2,44 kWh den ganzen Tag liegen, waehrend das Haus morgens zu 36 ct aus dem
+    # Netz lief. Massstab ist darum, was die kWh spaeter noch bringt, mit zwei
+    # Deckeln: (a) die beste Stunde des Referenztags (Haus zum Einkaufspreis, im
+    # Bonusfenster Export zum Teruglever-Wert), (b) der Nachkauf in der billigsten
+    # Stunde des Referenztags, denn mehr als den Nachkauf ist Halten nie wert.
+    # Referenztag ist der Folgetag, sobald seine Kurve vorliegt, sonst der
+    # geplante Tag selbst (siehe rechne_und_publiziere).
+    sqrt_rt = math.sqrt(cfg["rt"])
+    best = None
+    billig = None
+    for h in range(24):
+        if pk["fehlt"][h] or pk["imp"][h] > 500:
+            continue
+        w = pk["imp"][h]
+        if export_ok is None or export_ok[h]:
+            w = max(w, pk["ter"][h])
+        best = w if best is None else max(best, w)
+        billig = pk["imp"][h] if billig is None else min(billig, pk["imp"][h])
+    if best is None:
+        return None
+    return round(max(0.0, min(sqrt_rt * best, billig / sqrt_rt)), 4)
+
+
 def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_max_w,
-              export_ok=None):
+              export_ok=None, reservation=None):
     # export_ok: je Stunde True/False, ob Entladung ueber den Hausbedarf hinaus
     # (Export aus dem Akku) erlaubt ist; None = ueberall erlaubt. Andre
     # 2026-09-03: Export nur im Zonnebonus-Fenster, sonst Nulleinspeisung.
+    # reservation: Halte-Schwelle fuer Startinhalt in EUR je gespeicherter kWh
+    # (siehe reservationswert); None = Einstand als Schwelle (Regel bis 1.3.4,
+    # nur noch als Referenz im Selbsttest).
     # Voll-dynamischer, verlustfreier Stunden-Optimierer (greedy best-pair).
     # 1:1-Port aus batterie_schatten.ps1; Eingaben in Meter-kWh, SoC-Bahn in
     # gespeicherten kWh.
@@ -602,6 +638,8 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     entl_max = entl_max_w / 1000.0
     lad_netz = LADEN_NETZ_MAX_W / 1000.0
     lad_pv = LADEN_PV_MAX_W / 1000.0
+
+    halte = einstand_start if reservation is None else reservation
 
     bedarf = [0.0] * n
     pv_frei = [0.0] * n
@@ -663,7 +701,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
                     frei = min(frei, soc[t] - boden)
                 raus_max = min(frei * sqrt_rt, entl_rest)
                 for raus, wert in block_kandidaten(k, raus_max):
-                    m = sqrt_rt * wert - einstand_start
+                    m = sqrt_rt * wert - halte
                     if m > best_marge:
                         h_raus = min(bedarf[k], raus)
                         best_marge = m
@@ -1116,6 +1154,64 @@ def _selbsttest_kern():
                           % (h, sim3["entl_exp"][h]))
     if sim3["entl_haus"][22] < min(0.8, netto3[22]) - 1e-6:
         fehler.append("Szenario 3: Hausbedarf 22h nicht gedeckt (%.2f kWh)." % sim3["entl_haus"][22])
+
+    # Szenario 4 (1.3.5): dieselbe Welt OHNE Saldering (ab 2027, oder Schalter
+    # in HA aus). Der 06:48-Lauf vom 03.09. mit Einstand 33,4 ct liess im
+    # Replay 2026-09-04 unter AUS 2,44 kWh den ganzen Tag liegen: ohne den um
+    # 11 ct hoeheren Exportwert gab es keine Abend-Ankerbuchung, die der
+    # Umschicht-Pass nach vorn ziehen konnte, und das Greedy-Gate hing am
+    # bezahlten Einstand. Mit der Halte-Schwelle aus dem Reservationswert
+    # (billigster Nachkauf des Tages) muss die Morgenstunde bedient werden und
+    # der Akku am Tagesende leer sein. Gegenprobe 4b (kein billiger Nachkauf,
+    # Mittag auf 0,19 geklemmt): Halten bleibt richtig, Stunde 7 bleibt leer.
+    cfg_aus = dict(cfg)
+    cfg_aus["saldering"] = False
+    cfg_aus["rt"] = rt
+    boden = KAP_KWH * BODEN_PCT / 100.0
+    for variante, mittag in (("4", None), ("4b", 0.19)):
+        b = list(beurs2)
+        if mittag is not None:
+            for h in range(8, 24):
+                b[h] = max(b[h], mittag)
+        imp4 = [x + 0.1327 for x in b]
+        ter4 = [wert_terug(b[h], h, cfg_aus) for h in range(24)]
+        pk4 = {"imp": list(imp4), "ter": list(ter4), "fehlt": [False] * 24}
+        res4 = reservationswert(pk4, cfg_aus, fenster)
+        for h in range(7):
+            imp4[h] = 999.0
+            ter4[h] = -999.0
+        alt4 = optimiere(imp4, ter4, netto2, soc2, einstand2, rt, puffer, 800, fenster)
+        alt4 = verbessere(alt4, imp4, ter4, netto2, soc2, einstand2, rt, puffer, 800, fenster)
+        opt4 = optimiere(imp4, ter4, netto2, soc2, einstand2, rt, puffer, 800, fenster, res4)
+        fein4 = verbessere(opt4, imp4, ter4, netto2, soc2, einstand2, rt, puffer, 800, fenster)
+        sim4 = simuliere(fein4["struktur"], imp4, ter4, netto2, soc2, einstand2, rt, 800)
+        entl7 = sim4["entl_haus"][7] + sim4["entl_exp"][7]
+        if not sim4["ok"]:
+            fehler.append("Szenario %s: Simulator lehnt den Plan ab." % variante)
+        if abs(sim4["eur"] - fein4["eur"]) > 0.005:
+            fehler.append("Szenario %s: Simulator-Bilanz weicht ab (%.4f vs %.4f)."
+                          % (variante, sim4["eur"], fein4["eur"]))
+        if fein4["eur"] < opt4["eur"] - 1e-6:
+            fehler.append("Szenario %s: Umschicht-Pass verschlechtert die Bilanz." % variante)
+        for h in range(24):
+            if sim4["entl_haus"][h] + sim4["entl_exp"][h] > 0.8 + 1e-6:
+                fehler.append("Szenario %s: Stunde %d ueber 800 W." % (variante, h))
+            if not fenster[h] and sim4["entl_exp"][h] > 1e-6:
+                fehler.append("Szenario %s: Export in Stunde %d ausserhalb des Bonusfensters."
+                              % (variante, h))
+        if mittag is None:
+            if entl7 < 0.5:
+                fehler.append("Szenario 4: Stunde 7 bleibt ohne Saldering leer (%.2f kWh), "
+                              "Halte-Schwelle wirkt nicht." % entl7)
+            if sim4["soc"][23] - boden > 0.3:
+                fehler.append("Szenario 4: %.2f kWh bleiben ohne Saldering ungenutzt im Akku."
+                              % (sim4["soc"][23] - boden))
+            if fein4["eur"] < alt4["eur"] + 0.05:
+                fehler.append("Szenario 4: Halte-Schwelle bringt keinen Gewinn gegen das "
+                              "Einstand-Gate (%.4f vs %.4f)." % (fein4["eur"], alt4["eur"]))
+        elif entl7 > 1e-6:
+            fehler.append("Szenario 4b: Stunde 7 verkauft ohne billigen Nachkauf (%.2f kWh)."
+                          % entl7)
     return fehler
 
 
@@ -1187,11 +1283,12 @@ def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kw
     return fehler
 
 
-def publiziere_plan(plan_tag, aktionen, eur):
+def publiziere_plan(plan_tag, aktionen, eur, saldering=None):
     payload = json.dumps({
         "datum": plan_tag.strftime("%Y-%m-%d"),
         "erzeugt": jetzt().strftime("%Y-%m-%d %H:%M:%S"),
         "eur": eur,
+        "saldering": saldering,  # Regime, in dem der Plan gerechnet wurde (1.3.5)
         "stunden": aktionen,
     }, separators=(",", ":"))
     discovery = json.dumps({
@@ -1210,7 +1307,7 @@ def publiziere_plan(plan_tag, aktionen, eur):
                                "payload": plan_tag.strftime("%Y-%m-%d"), "retain": True})
 
 
-def publiziere_status(status, detail, eur=None):
+def publiziere_status(status, detail, eur=None, saldering=None):
     discovery = json.dumps({
         "name": "Batterie v2 Planner Status",
         "unique_id": "brainwiki_batterie_v2planner",
@@ -1220,7 +1317,8 @@ def publiziere_status(status, detail, eur=None):
         "icon": "mdi:calculator-variant",
     }, separators=(",", ":"))
     attr = json.dumps({"zeit": jetzt().strftime("%Y-%m-%d %H:%M:%S"),
-                       "detail": detail, "eur_rest": eur}, separators=(",", ":"))
+                       "detail": detail, "eur_rest": eur, "saldering": saldering},
+                      separators=(",", ":"))
     try:
         dienst("mqtt", "publish", {"topic": "homeassistant/sensor/brainwiki_batterie_v2planner/config",
                                    "payload": discovery, "retain": True})
@@ -1253,10 +1351,12 @@ def vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde):
     return neu
 
 
-def plan_unveraendert(plan_tag, aktionen, ab_stunde):
+def plan_unveraendert(plan_tag, aktionen, ab_stunde, saldering=None):
     letzter = lade_json(LAST_PLAN_PATH, None)
     if not letzter or letzter.get("datum") != plan_tag.strftime("%Y-%m-%d"):
         return False
+    if letzter.get("saldering") != saldering:
+        return False  # Regimewechsel: publizieren, auch wenn die Aktionen gleich bleiben
     alte = {a["h"]: (a["aktion"], a["watt"]) for a in letzter.get("stunden", [])}
     for a in aktionen:
         if a["h"] < ab_stunde:
@@ -1279,7 +1379,7 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         detail = ("%s: %d Beurs-Stunden ab %02d:00 fehlen, kein neuer Plan "
                   "(letzter gueltiger Plan bleibt stehen)." % (anlass, fehlt_rest, ab_stunde))
         log("WARNUNG: " + detail)
-        publiziere_status("warnung", detail)
+        publiziere_status("warnung", detail, None, cfg["saldering"])
         return
 
     profil = haus_profil(state, int(opts.get("profil_tage", 14)))
@@ -1302,8 +1402,21 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     # Export aus dem Akku nur im Zonnebonus-Fenster (Andre 2026-09-03), sonst
     # deckt die Entladung nur den Hausbedarf (anti_feed = Nulleinspeisung).
     export_ok = [cfg["venster_von"] <= h < cfg["venster_bis"] for h in range(24)]
+    # Halte-Schwelle fuer Startinhalt (1.3.5): Folgetag als Referenz, sobald
+    # seine Beurs-Kurve vollstaendig da ist (ab ~13 Uhr), sonst der geplante Tag
+    # selbst mit voller Kurve (auch die vergangenen Stunden) als Naeherung.
+    ref_tag = plan_tag + timedelta(days=1)
+    ref_name = "Folgetag"
+    pk_ref = preis_kurven(ref_tag, karte, offset, cfg, karte_ne)
+    if any(pk_ref["fehlt"]):
+        pk_ref = preis_kurven(plan_tag, karte, offset, cfg, karte_ne)
+        ref_name = "Tageskurve"
+    reservation = reservationswert(pk_ref, cfg, export_ok)
+    if reservation is None:
+        reservation = einstand
+        ref_name = "Einstand"
     opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
-                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
+                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, reservation)
     try:
         opt = verbessere(opt, pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
                          cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
@@ -1316,27 +1429,31 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         detail = "%s: Invarianten verletzt, Plan NICHT publiziert: %s" % (anlass, " | ".join(fehler))
         log("FEHLER: " + detail)
         melde("Batterie-Planer: Plan verworfen", detail)
-        publiziere_status("fehler", detail)
+        publiziere_status("fehler", detail, None, cfg["saldering"])
         return
 
-    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %.1f %%, Einstand %.1f ct)"
+    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %.1f %%, Einstand %.1f ct, "
+        "Halte-Schwelle %.1f ct aus %s, Saldering %s)"
         % (anlass, plan_tag.strftime("%Y-%m-%d"), ab_stunde, opt["eur"],
-           len(opt["trades"]), soc_pct, einstand * 100))
+           len(opt["trades"]), soc_pct, einstand * 100, reservation * 100, ref_name,
+           "an" if cfg["saldering"] else "aus"))
     for t in opt["trades"]:
         log("  " + t)
 
-    if plan_unveraendert(plan_tag, aktionen, ab_stunde):
+    if plan_unveraendert(plan_tag, aktionen, ab_stunde, cfg["saldering"]):
         log("Plan unveraendert, kein Publish (Flatter-Bremse).")
-        publiziere_status("ok", "%s: Plan unveraendert." % anlass, opt["eur"])
+        publiziere_status("ok", "%s: Plan unveraendert." % anlass, opt["eur"], cfg["saldering"])
         return
 
     aktionen = vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde)
-    publiziere_plan(plan_tag, aktionen, opt["eur"])
-    schreibe_json(LAST_PLAN_PATH, {"datum": plan_tag.strftime("%Y-%m-%d"), "stunden": aktionen})
+    publiziere_plan(plan_tag, aktionen, opt["eur"], cfg["saldering"])
+    schreibe_json(LAST_PLAN_PATH, {"datum": plan_tag.strftime("%Y-%m-%d"),
+                                   "saldering": cfg["saldering"], "stunden": aktionen})
     aktiv = sum(1 for a in aktionen if a["aktion"] not in ("RUHE", "VORBEI"))
     log("PLAN VEROEFFENTLICHT: %s, %d aktive Stunden -> sensor.batterie_v2_plan"
         % (plan_tag.strftime("%Y-%m-%d"), aktiv))
-    publiziere_status("ok", "%s: Plan publiziert (%d aktive Stunden)." % (anlass, aktiv), opt["eur"])
+    publiziere_status("ok", "%s: Plan publiziert (%d aktive Stunden)." % (anlass, aktiv),
+                      opt["eur"], cfg["saldering"])
 
 
 def plan_heute(state, opts):
@@ -1373,7 +1490,8 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (3 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne billigen Nachkauf).")
+    log("Selbsttest bestanden (5 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
+        "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
