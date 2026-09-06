@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.4.0 (2026-09-06)
+
+- **Folgetag-Vorschau auf eigenem Topic** (`sensor.batterie_v2_plan_morgen`,
+  `brainwiki/batterie/v2plan_morgen`, retained): Andre 2026-09-06: die
+  NextEnergy-Preise fuer morgen kommen ab ~13:30, der Folgetagsplan lief aber
+  erst um 23:takt. Frueher rechnen auf dem Haupt-Topic ging nicht, weil
+  Executor und Failsafe das Plan-Datum gegen heute pruefen: ein Morgen-Plan um
+  14 Uhr haette das Haus bis Mitternacht ohne gueltigen Plan gelassen. Jetzt
+  rechnet jeder Stundenlauf den Folgetag zusaetzlich, sobald die Beurs-Kurve
+  fuer morgen vollstaendig ist (kein fester Zeitpunkt, keine Option: die Daten
+  selbst loesen aus), nimmt damit jede Solcast-Aktualisierung spaetestens eine
+  Stunde spaeter mit und publiziert nur bei Aenderung (eigene Flatter-Bremse
+  `last_plan_morgen.json`). Start-SoC ist der prognostizierte Tagesend-SoC des
+  Heute-Plans (`state.soc_ende_heute`), nicht der Live-SoC; Attribute
+  `start_soc_pct` und `start_soc_quelle` zeigen das. Die Vorschau ist reine
+  Anzeige: sie fasst weder Status-Sensor noch Einstand an und meldet
+  Stoerungen nur im Log.
+- **Tageslauf um 00:00:30 statt Folgetagsplan um 23:takt.** Der volle neue Tag
+  wird mit echtem SoC ins Haupt-Topic gerechnet (`PLAN TAG` ab Stunde 0). Der
+  Executor zieht auf den Sensorwechsel und ohnehin um hh:01, der Failsafe um
+  hh:31. Damit ist das taegliche Loch zwischen 23:takt und Mitternacht weg,
+  in dem ein Plan mit Morgen-Datum stand, den niemand ausfuehrte (Befund
+  2026-09-05). Zwischen 00:00:00 und 00:00:30 gilt kurz noch der Vortagsplan
+  (Datum gestern, Executor wartet), das sind Sekunden statt zwoelf Minuten.
+  `naechster_lauf()` liefert den Weckzeitpunkt; bei `takt_minute` 0 fallen
+  Stundenlauf und Tageslauf zusammen.
+- `rechne_und_publiziere()` kennt zwei Ziele (`haupt` / `vorschau`), nimmt
+  einen Start-SoC entgegen und gibt `{soc_ende, eur}` zurueck.
+  `publiziere_plan()` und `plan_unveraendert()` arbeiten je Ziel.
+- Selbsttest um Szenario 6 erweitert (Zeitplan der Laeufe, acht Faelle inkl.
+  Mitternachtskante und `takt_minute` 0).
+- Trockenlauf vom Laptop gegen die echten HA-Daten (Publishes abgefangen):
+  Heute-Plan liefert End-SoC 12,3 %, Vorschau fuer den 07.09. mit 14 aktiven
+  Stunden, zweiter Vorschau-Lauf greift in die Flatter-Bremse, voller
+  Tageslauf publiziert aufs Haupt-Topic.
+
 ## 1.3.5 (2026-09-04)
 
 - **Halte-Schwelle fuer Startinhalt vom Einstand geloest:** der Greedy mass

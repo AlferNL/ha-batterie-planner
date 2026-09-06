@@ -7,7 +7,14 @@
 # ist der EINZIGE Schreiber des Plans (brainwiki/batterie/v2plan, MQTT retained).
 #
 # Ablauf: jede Stunde um Minute :takt_minute wird der Rest des Tages neu geplant
-# (Ist-SoC, Rest-Preise, frisches Solcast); um 23:takt zusaetzlich der Folgetag.
+# (Ist-SoC, Rest-Preise, frisches Solcast). Um 00:00:30 rechnet ein eigener
+# Tageslauf den vollen neuen Tag mit echtem SoC (1.4.0; bis 1.3.5 lief der
+# Folgetagsplan um 23:takt auf dasselbe Topic und liess bis Mitternacht ein
+# Loch, in dem der Executor keinen gueltigen Plan sah). Sobald die Beurs-Kurve
+# fuer morgen vollstaendig ist (ab ~13:30), rechnet jeder Stundenlauf zusaetzlich
+# eine Folgetag-VORSCHAU auf ein zweites retained Topic
+# (sensor.batterie_v2_plan_morgen); sie ist reine Anzeige, das Haus faehrt nur
+# den Hauptplan. Kein fester Zeitpunkt: die Daten selbst loesen aus.
 # Die laufende Stunde ist eingefroren (kein Umschalten mitten in der Stunde).
 # Publiziert wird nur, wenn sich der Restplan wirklich aendert (Flatter-Bremse).
 #
@@ -50,9 +57,17 @@ DATA_DIR = "/data"
 OPTIONS_PATH = os.path.join(DATA_DIR, "options.json")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 LAST_PLAN_PATH = os.path.join(DATA_DIR, "last_plan.json")
+LAST_VORSCHAU_PATH = os.path.join(DATA_DIR, "last_plan_morgen.json")
 
 PLAN_TOPIC_BASIS = "brainwiki/batterie/v2plan"
+VORSCHAU_TOPIC_BASIS = "brainwiki/batterie/v2plan_morgen"
 STATUS_TOPIC_BASIS = "brainwiki/batterie/v2planner"
+
+# Mitternachtslauf (1.4.0): Sekunde nach 00:00, zu der der volle Tagesplan
+# gerechnet wird. 30 s Abstand, damit HA die Stundengrenze (Preis-Sensoren,
+# Solcast-Tageswechsel) sicher hinter sich hat; der Executor zieht auf den
+# Sensorwechsel und ohnehin um hh:01.
+MITTERNACHT_SEKUNDE = 30
 
 ZAEHLER = {
     "imp": "sensor.p1_meter_energy_import",
@@ -1212,6 +1227,26 @@ def _selbsttest_kern():
         elif entl7 > 1e-6:
             fehler.append("Szenario 4b: Stunde 7 verkauft ohne billigen Nachkauf (%.2f kWh)."
                           % entl7)
+
+    # Szenario 6 (1.4.0): Zeitplan der Hauptschleife. Stundenlauf hh:takt,
+    # Mitternachtslauf 00:00:MITTERNACHT_SEKUNDE, bei takt 0 fallen beide
+    # zusammen (der 00:00-Stundenlauf ist dann der Tageslauf).
+    mn_s = MITTERNACHT_SEKUNDE
+    faelle = [
+        (datetime(2026, 9, 6, 14, 10), 48, datetime(2026, 9, 6, 14, 48), False),
+        (datetime(2026, 9, 6, 23, 50), 48, datetime(2026, 9, 7, 0, 0, mn_s), True),
+        (datetime(2026, 9, 7, 0, 0, 0), 48, datetime(2026, 9, 7, 0, 0, mn_s), True),
+        (datetime(2026, 9, 7, 0, 0, mn_s), 48, datetime(2026, 9, 7, 0, 48), False),
+        (datetime(2026, 9, 7, 0, 0, mn_s + 1), 48, datetime(2026, 9, 7, 0, 48), False),
+        (datetime(2026, 9, 6, 23, 50), 0, datetime(2026, 9, 7, 0, 0), True),
+        (datetime(2026, 9, 7, 0, 10), 0, datetime(2026, 9, 7, 1, 0), False),
+        (datetime(2026, 9, 6, 0, 5), 3, datetime(2026, 9, 6, 1, 3), False),
+    ]
+    for (nun, takt, soll, soll_mn) in faelle:
+        ziel, mn = naechster_lauf(nun, takt)
+        if ziel != soll or mn != soll_mn:
+            fehler.append("Szenario 6: naechster_lauf(%s, takt %d) = (%s, %s), erwartet (%s, %s)."
+                          % (nun, takt, ziel, mn, soll, soll_mn))
     return fehler
 
 
@@ -1283,27 +1318,49 @@ def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kw
     return fehler
 
 
-def publiziere_plan(plan_tag, aktionen, eur, saldering=None):
-    payload = json.dumps({
+# Zwei Plan-Ziele (1.4.0): "haupt" ist der Plan, den das Haus faehrt (Executor
+# und Failsafe pruefen sein Datum gegen heute); "vorschau" ist der Folgetag als
+# reine Anzeige auf einem eigenen Topic. Ein frueher Folgetagsplan auf dem
+# Haupt-Topic haette das Haus bis Mitternacht ohne gueltigen Plan gelassen.
+ZIELE = {
+    "haupt": {"topic": PLAN_TOPIC_BASIS, "uid": "brainwiki_batterie_v2plan",
+              "object_id": "batterie_v2_plan", "name": "Batterie v2 Plan",
+              "icon": "mdi:battery-clock"},
+    "vorschau": {"topic": VORSCHAU_TOPIC_BASIS, "uid": "brainwiki_batterie_v2plan_morgen",
+                 "object_id": "batterie_v2_plan_morgen", "name": "Batterie v2 Plan morgen",
+                 "icon": "mdi:battery-clock-outline"},
+}
+
+
+def last_plan_pfad(ziel):
+    return LAST_PLAN_PATH if ziel == "haupt" else LAST_VORSCHAU_PATH
+
+
+def publiziere_plan(plan_tag, aktionen, eur, saldering=None, ziel="haupt", extra=None):
+    z = ZIELE[ziel]
+    inhalt = {
         "datum": plan_tag.strftime("%Y-%m-%d"),
         "erzeugt": jetzt().strftime("%Y-%m-%d %H:%M:%S"),
         "eur": eur,
         "saldering": saldering,  # Regime, in dem der Plan gerechnet wurde (1.3.5)
         "stunden": aktionen,
-    }, separators=(",", ":"))
+    }
+    if extra:
+        inhalt.update(extra)
+    payload = json.dumps(inhalt, separators=(",", ":"))
     discovery = json.dumps({
-        "name": "Batterie v2 Plan",
-        "unique_id": "brainwiki_batterie_v2plan",
-        "object_id": "batterie_v2_plan",
-        "state_topic": PLAN_TOPIC_BASIS + "/state",
-        "json_attributes_topic": PLAN_TOPIC_BASIS + "/attr",
-        "icon": "mdi:battery-clock",
+        "name": z["name"],
+        "unique_id": z["uid"],
+        "object_id": z["object_id"],
+        "state_topic": z["topic"] + "/state",
+        "json_attributes_topic": z["topic"] + "/attr",
+        "icon": z["icon"],
     }, separators=(",", ":"))
-    dienst("mqtt", "publish", {"topic": "homeassistant/sensor/brainwiki_batterie_v2plan/config",
+    dienst("mqtt", "publish", {"topic": "homeassistant/sensor/%s/config" % z["uid"],
                                "payload": discovery, "retain": True})
-    dienst("mqtt", "publish", {"topic": PLAN_TOPIC_BASIS + "/attr",
+    dienst("mqtt", "publish", {"topic": z["topic"] + "/attr",
                                "payload": payload, "retain": True})
-    dienst("mqtt", "publish", {"topic": PLAN_TOPIC_BASIS + "/state",
+    dienst("mqtt", "publish", {"topic": z["topic"] + "/state",
                                "payload": plan_tag.strftime("%Y-%m-%d"), "retain": True})
 
 
@@ -1351,8 +1408,8 @@ def vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde):
     return neu
 
 
-def plan_unveraendert(plan_tag, aktionen, ab_stunde, saldering=None):
-    letzter = lade_json(LAST_PLAN_PATH, None)
+def plan_unveraendert(plan_tag, aktionen, ab_stunde, saldering=None, ziel="haupt"):
+    letzter = lade_json(last_plan_pfad(ziel), None)
     if not letzter or letzter.get("datum") != plan_tag.strftime("%Y-%m-%d"):
         return False
     if letzter.get("saldering") != saldering:
@@ -1367,7 +1424,15 @@ def plan_unveraendert(plan_tag, aktionen, ab_stunde, saldering=None):
 
 
 # --------------------------------------------------------------- Planungslaeufe
-def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, anlass):
+def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, anlass,
+                          ziel="haupt", soc_start_kwh=None, soc_quelle="live"):
+    # ziel "haupt": der Plan fuers Haus (Status-Sensor, Einstand-Pflege,
+    # Uebernahme vergangener Stunden). ziel "vorschau" (1.4.0): der Folgetag als
+    # Anzeige, rechnet mit dem uebergebenen Start-SoC, fasst weder Status noch
+    # Einstand an und meldet Stoerungen nur im Log.
+    # Rueckgabe: {"soc_ende", "eur"} des gerechneten Plans (auch wenn die
+    # Flatter-Bremse den Publish sparte), None wenn kein Plan zustande kam.
+    haupt = (ziel == "haupt")
     cfg = lese_konfig()
     karte = beurs_karte()
     karte_ne = ne_karte()
@@ -1379,8 +1444,9 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
         detail = ("%s: %d Beurs-Stunden ab %02d:00 fehlen, kein neuer Plan "
                   "(letzter gueltiger Plan bleibt stehen)." % (anlass, fehlt_rest, ab_stunde))
         log("WARNUNG: " + detail)
-        publiziere_status("warnung", detail, None, cfg["saldering"])
-        return
+        if haupt:
+            publiziere_status("warnung", detail, None, cfg["saldering"])
+        return None
 
     profil = haus_profil(state, int(opts.get("profil_tage", 14)))
     pv = solcast_stunden(pv_entity, plan_tag, pv_feld)
@@ -1395,10 +1461,17 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
 
     if "einstand" not in state:
         state["einstand"] = float(opts.get("einstand_start", 0.15))
-    einstand = einstand_pflegen(state, cfg, karte, offset, karte_ne)
+    if haupt:
+        einstand = einstand_pflegen(state, cfg, karte, offset, karte_ne)
+    else:
+        einstand = float(state["einstand"])
 
-    soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
-    soc_start_kwh = KAP_KWH * soc_pct / 100.0
+    if soc_start_kwh is None:
+        soc_pct = zahl("sensor.marstek_venus_modbus_soc_batterie", 50)
+        soc_start_kwh = KAP_KWH * soc_pct / 100.0
+    else:
+        soc_start_kwh = min(KAP_KWH, max(0.0, float(soc_start_kwh)))
+        soc_pct = soc_start_kwh / KAP_KWH * 100.0
     # Export aus dem Akku nur im Zonnebonus-Fenster (Andre 2026-09-03), sonst
     # deckt die Entladung nur den Hausbedarf (anti_feed = Nulleinspeisung).
     export_ok = [cfg["venster_von"] <= h < cfg["venster_bis"] for h in range(24)]
@@ -1428,38 +1501,53 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     if fehler:
         detail = "%s: Invarianten verletzt, Plan NICHT publiziert: %s" % (anlass, " | ".join(fehler))
         log("FEHLER: " + detail)
-        melde("Batterie-Planer: Plan verworfen", detail)
-        publiziere_status("fehler", detail, None, cfg["saldering"])
-        return
+        if haupt:
+            melde("Batterie-Planer: Plan verworfen", detail)
+            publiziere_status("fehler", detail, None, cfg["saldering"])
+        return None
 
-    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %.1f %%, Einstand %.1f ct, "
+    soc_text = "%.1f %%" % soc_pct
+    if soc_quelle != "live":
+        soc_text += " aus %s" % soc_quelle
+    log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %s, Einstand %.1f ct, "
         "Halte-Schwelle %.1f ct aus %s, Saldering %s)"
         % (anlass, plan_tag.strftime("%Y-%m-%d"), ab_stunde, opt["eur"],
-           len(opt["trades"]), soc_pct, einstand * 100, reservation * 100, ref_name,
+           len(opt["trades"]), soc_text, einstand * 100, reservation * 100, ref_name,
            "an" if cfg["saldering"] else "aus"))
     for t in opt["trades"]:
         log("  " + t)
+    ergebnis = {"soc_ende": opt["soc"][23], "eur": opt["eur"]}
 
-    if plan_unveraendert(plan_tag, aktionen, ab_stunde, cfg["saldering"]):
+    if plan_unveraendert(plan_tag, aktionen, ab_stunde, cfg["saldering"], ziel):
         log("Plan unveraendert, kein Publish (Flatter-Bremse).")
-        publiziere_status("ok", "%s: Plan unveraendert." % anlass, opt["eur"], cfg["saldering"])
-        return
+        if haupt:
+            publiziere_status("ok", "%s: Plan unveraendert." % anlass, opt["eur"], cfg["saldering"])
+        return ergebnis
 
-    aktionen = vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde)
-    publiziere_plan(plan_tag, aktionen, opt["eur"], cfg["saldering"])
-    schreibe_json(LAST_PLAN_PATH, {"datum": plan_tag.strftime("%Y-%m-%d"),
-                                   "saldering": cfg["saldering"], "stunden": aktionen})
+    extra = None
+    if haupt:
+        aktionen = vergangene_stunden_uebernehmen(aktionen, plan_tag, ab_stunde)
+    else:
+        extra = {"start_soc_pct": round(soc_pct, 1), "start_soc_quelle": soc_quelle}
+    publiziere_plan(plan_tag, aktionen, opt["eur"], cfg["saldering"], ziel, extra)
+    schreibe_json(last_plan_pfad(ziel), {"datum": plan_tag.strftime("%Y-%m-%d"),
+                                         "saldering": cfg["saldering"], "stunden": aktionen})
     aktiv = sum(1 for a in aktionen if a["aktion"] not in ("RUHE", "VORBEI"))
-    log("PLAN VEROEFFENTLICHT: %s, %d aktive Stunden -> sensor.batterie_v2_plan"
-        % (plan_tag.strftime("%Y-%m-%d"), aktiv))
-    publiziere_status("ok", "%s: Plan publiziert (%d aktive Stunden)." % (anlass, aktiv),
-                      opt["eur"], cfg["saldering"])
+    log("%s VEROEFFENTLICHT: %s, %d aktive Stunden -> sensor.%s"
+        % ("PLAN" if haupt else "VORSCHAU", plan_tag.strftime("%Y-%m-%d"), aktiv,
+           ZIELE[ziel]["object_id"]))
+    if haupt:
+        publiziere_status("ok", "%s: Plan publiziert (%d aktive Stunden)." % (anlass, aktiv),
+                          opt["eur"], cfg["saldering"])
+    return ergebnis
 
 
-def plan_heute(state, opts):
+def plan_heute(state, opts, voll=False):
+    # voll=True (Mitternachtslauf 1.4.0): der ganze Tag ab Stunde 0 mit echtem
+    # SoC. Sonst der Resttag ab der naechsten Stunde (laufende eingefroren).
     nun = jetzt()
     tag0 = nun.replace(hour=0, minute=0, second=0, microsecond=0)
-    ab = nun.hour + 1  # laufende Stunde ist eingefroren
+    ab = 0 if voll else nun.hour + 1
     if ab >= 24:
         log("PlanHeute: Tag vorbei, nichts mehr zu planen.")
         return
@@ -1467,18 +1555,59 @@ def plan_heute(state, opts):
         log("WARNUNG: DST-Umstelltag, kein Tagesplan.")
         publiziere_status("warnung", "DST-Umstelltag, kein Plan fuer heute.")
         return
-    rechne_und_publiziere(tag0, ab, "sensor.solcast_pv_forecast_prognose_heute",
-                          "pv_estimate", state, opts, "PLAN HEUTE")
+    erg = rechne_und_publiziere(tag0, ab, "sensor.solcast_pv_forecast_prognose_heute",
+                                "pv_estimate", state, opts, "PLAN TAG" if voll else "PLAN HEUTE")
+    if erg is not None:
+        # Erwarteter Akkuinhalt um Mitternacht: Start-SoC der Folgetag-Vorschau.
+        state["soc_ende_heute"] = {"datum": tag0.strftime("%Y-%m-%d"),
+                                   "kwh": round(erg["soc_ende"], 3)}
 
 
-def plan_morgen(state, opts):
-    tag0 = (jetzt() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+def plan_vorschau_morgen(state, opts):
+    # Folgetag-Vorschau (1.4.0) auf sensor.batterie_v2_plan_morgen: laeuft in
+    # jedem Stundenlauf, sobald die Beurs-Kurve fuer morgen vollstaendig da ist
+    # (ab ~13:30), und nimmt danach jede Solcast-Aktualisierung mit (publiziert
+    # nur bei Aenderung). Kein fester Zeitpunkt, die Daten selbst loesen aus.
+    # Start-SoC ist der prognostizierte Tagesend-SoC des Heute-Plans; fehlt der
+    # (Neustart spaet am Abend), der Live-SoC.
+    nun = jetzt()
+    tag0 = (nun + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     if ist_dst_tag(tag0):
-        log("WARNUNG: Morgen ist DST-Umstelltag, kein Folgetagsplan.")
-        publiziere_status("warnung", "DST-Umstelltag morgen, kein Folgetagsplan.")
+        log("Vorschau morgen: DST-Umstelltag, keine Vorschau.")
         return
+    tag_key = tag0.strftime("%Y-%m-%d")
+    karte = beurs_karte()
+    fehlt = sum(1 for h in range(24) if "%s %02d" % (tag_key, h) not in karte)
+    if fehlt > 0:
+        log("Vorschau morgen: Beurs-Kurve fuer %s noch unvollstaendig (%d Stunden fehlen), warte."
+            % (tag_key, fehlt))
+        return
+    ende = state.get("soc_ende_heute") or {}
+    if ende.get("datum") == nun.strftime("%Y-%m-%d"):
+        soc_start, quelle = float(ende["kwh"]), "Heute-Plan-Ende"
+    else:
+        soc_start, quelle = None, "live"
     rechne_und_publiziere(tag0, 0, "sensor.solcast_pv_forecast_prognose_morgen",
-                          "pv_estimate", state, opts, "PLAN MORGEN")
+                          "pv_estimate", state, opts, "VORSCHAU MORGEN",
+                          ziel="vorschau", soc_start_kwh=soc_start, soc_quelle=quelle)
+
+
+def naechster_lauf(nun, takt):
+    # Naechster Weckzeitpunkt der Hauptschleife: stuendlich hh:takt, dazu der
+    # Mitternachtslauf 00:00:MITTERNACHT_SEKUNDE (1.4.0). Rueckgabe
+    # (zeit, ist_mitternacht). Bei takt 0 faellt beides zusammen: dann ist der
+    # 00:00-Stundenlauf der Tageslauf.
+    ziel = nun.replace(minute=takt, second=0, microsecond=0)
+    if ziel <= nun:
+        ziel += timedelta(hours=1)
+    if takt == 0:
+        return ziel, ziel.hour == 0
+    mn = nun.replace(hour=0, minute=0, second=MITTERNACHT_SEKUNDE, microsecond=0)
+    if mn <= nun:
+        mn += timedelta(days=1)
+    if mn < ziel:
+        return mn, True
+    return ziel, False
 
 
 # ------------------------------------------------------------------- Hauptloop
@@ -1490,8 +1619,9 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (5 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
-        "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe).")
+    log("Selbsttest bestanden (6 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
+        "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe, "
+        "Zeitplan der Laeufe).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
@@ -1508,8 +1638,9 @@ def main():
     if TZ is None:
         raise SystemExit("HA-API nicht erreichbar, Abbruch.")
 
-    log("Batterie-Planer v2 gestartet (Takt hh:%02d, Einstand %.2f, Profil %d Tage)."
-        % (takt, float(opts.get("einstand_start", 0.15)), profil_tage))
+    log("Batterie-Planer v2 gestartet (Takt hh:%02d, Tageslauf 00:00:%02d, Vorschau Folgetag "
+        "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage)."
+        % (takt, MITTERNACHT_SEKUNDE, float(opts.get("einstand_start", 0.15)), profil_tage))
 
     state = lade_json(STATE_PATH, {"tage": {}})
     if "tage" not in state:
@@ -1519,33 +1650,41 @@ def main():
     except Exception as e:
         log("WARNUNG: Profil-Aufbau fehlgeschlagen (%s), Notnagel-Profil aktiv." % e)
 
-    # Erster Lauf sofort, danach stuendlich um hh:takt.
+    # Erster Lauf sofort, danach stuendlich um hh:takt plus Tageslauf um Mitternacht.
     try:
         plan_heute(state, opts)
     except Exception as e:
         log("FEHLER PlanHeute (Start): %s" % e)
         melde("Batterie-Planer: Fehler", "Startlauf fehlgeschlagen: %s" % e)
         publiziere_status("fehler", "Startlauf: %s" % e)
+    try:
+        plan_vorschau_morgen(state, opts)
+    except Exception as e:
+        log("FEHLER Vorschau morgen (Start, nur Anzeige): %s" % e)
 
     while True:
-        nun = jetzt()
-        ziel = nun.replace(minute=takt, second=0, microsecond=0)
-        if ziel <= nun:
-            ziel += timedelta(hours=1)
-        time.sleep(max(5.0, (ziel - nun).total_seconds()))
+        ziel, mitternacht = naechster_lauf(jetzt(), takt)
+        time.sleep(max(5.0, (ziel - jetzt()).total_seconds()))
+        name = "Tageslauf" if mitternacht else "Stundenlauf"
         try:
             opts = lade_json(OPTIONS_PATH, opts)
             lauf = jetzt()
-            if lauf.hour == 1:
-                state = lade_json(STATE_PATH, state)
-                state = profil_auffuellen(state, profil_tage)
-            plan_heute(state, opts)
-            if lauf.hour == 23:
-                plan_morgen(state, opts)
+            if mitternacht:
+                plan_heute(state, opts, voll=True)
+            else:
+                if lauf.hour == 1:
+                    state = lade_json(STATE_PATH, state)
+                    state = profil_auffuellen(state, profil_tage)
+                plan_heute(state, opts)
         except Exception as e:
-            log("FEHLER im Stundenlauf: %s" % e)
-            melde("Batterie-Planer: Fehler", "Stundenlauf fehlgeschlagen: %s" % e)
-            publiziere_status("fehler", "Stundenlauf: %s" % e)
+            log("FEHLER im %s: %s" % (name, e))
+            melde("Batterie-Planer: Fehler", "%s fehlgeschlagen: %s" % (name, e))
+            publiziere_status("fehler", "%s: %s" % (name, e))
+        if not mitternacht:
+            try:
+                plan_vorschau_morgen(state, opts)
+            except Exception as e:
+                log("FEHLER Vorschau morgen (nur Anzeige): %s" % e)
 
 
 if __name__ == "__main__":
