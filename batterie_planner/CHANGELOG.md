@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.5.0 (2026-09-27)
+
+- **Warte-Aufschlag fuer die PV-Stunde** (neue Option `frueh_ct_je_stunde`,
+  Default 0,3 ct/kWh je Stunde). Andre 2026-09-27: der Tagesplan liess die
+  Stunden 11 und 12 auf RUHE, 1,04 kWh PV gingen ins Netz, geladen wurde erst
+  ab 13 Uhr, weil die PV-Stunden 13 bis 15 um 0,1 ct billiger waren (Beurs
+  0,14 ct um 12 Uhr gegen 0,01 ct um 13 Uhr). Der Plan wettete damit auf die
+  Nachmittagssonne, und die Erzeugung lag an dem Tag unter der
+  Solcast-Prognose. Andre: "erst laden"; ein voller Akku mit Export am
+  Nachmittag ist das kleinere Uebel als ein halbvoller Abend.
+- Wirkung: der Greedy entscheidet wie bisher nach echter Marge, WAS passiert
+  (welche Senke, Startinhalt oder Ladung, Netz oder PV). Ist seine Wahl eine
+  PV-Ladung, nimmt er fuer dieselbe Senke die frueheste PV-Stunde, die
+  hoechstens 0,3 ct je Stunde Abstand teurer ist. Deutlich billigere spaetere
+  Stunden (etwa negative Beurs) gewinnen weiter. Bilanz, Zulassung (Marge
+  ueber `gate_puffer`), Netzladung und Startinhalt bleiben unberuehrt;
+  Option 0 = Verhalten bis 1.4.0.
+- Verworfener erster Entwurf: ein Aufschlag auf ALLE Ladequellen verschob die
+  Nutzung des Startinhalts (Selbsttest 4b rot, ein Testfall -1,8 ct/Tag).
+- Trockenlauf gegen die echten HA-Daten vom 27.09. (Publishes abgefangen,
+  nur lesend): Tageslauf 00:00:30 laedt ab 11 Uhr (SoC um 13 Uhr 34 % statt
+  12 %, um 15 Uhr 92 % statt 62 %), Bilanz -0,23 ct; Stundenlauf 11:48 laedt
+  ab 12 Uhr (-0,17 ct); ab 14 Uhr identisch. Wechselwirkungstest (10 Faelle
+  mit Startinhalt, Morgenspitze, knapper und reichlicher PV):
+  Morgenentladung, PV- und Netzmenge identisch, schlechtester Fall
+  -0,19 ct/Tag. Alte Selbsttest-Szenarien mit 0,3 ct/h gruen,
+  `test_block.py` gruen.
+- Selbsttest um Szenario 7 erweitert: 7a frueh laden ohne Netzstrom, 7b
+  Aufschlag 0 = Reihenfolge 1.4.0, 7c negative Beurs wartet weiter, 7d
+  Startinhalt-Schutz mit genau den Eingaben, an denen der erste Entwurf
+  scheiterte.
+- Planlauf-Logzeile und Startzeile nennen den Warte-Aufschlag.
+
 ## 1.4.0 (2026-09-06)
 
 - **Folgetag-Vorschau auf eigenem Topic** (`sensor.batterie_v2_plan_morgen`,

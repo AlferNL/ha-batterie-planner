@@ -607,6 +607,19 @@ def haus_profil(state, profil_tage=None):
 
 
 # ------------------------------------------------------------------ Optimierer
+FRUEH_CT_DEFAULT = 0.3
+
+
+def frueh_aufschlag(opts):
+    # Option frueh_ct_je_stunde (ct/kWh je Stunde Warten) als EUR/kWh.
+    # Unlesbar oder negativ faellt auf den Default bzw. 0 zurueck.
+    try:
+        wert = float(opts.get("frueh_ct_je_stunde", FRUEH_CT_DEFAULT))
+    except (TypeError, ValueError):
+        wert = FRUEH_CT_DEFAULT
+    return max(0.0, wert) / 100.0
+
+
 def reservationswert(pk, cfg, export_ok):
     # Wert einer GESPEICHERTEN kWh ueber den Planhorizont hinaus (1.3.5), EUR/kWh.
     # Der Einstand ist bezahlt (Sunk Cost) und taugt nicht als Verkaufsgrenze:
@@ -637,13 +650,25 @@ def reservationswert(pk, cfg, export_ok):
 
 
 def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_max_w,
-              export_ok=None, reservation=None):
+              export_ok=None, reservation=None, frueh=0.0):
     # export_ok: je Stunde True/False, ob Entladung ueber den Hausbedarf hinaus
     # (Export aus dem Akku) erlaubt ist; None = ueberall erlaubt. Andre
     # 2026-09-03: Export nur im Zonnebonus-Fenster, sonst Nulleinspeisung.
     # reservation: Halte-Schwelle fuer Startinhalt in EUR je gespeicherter kWh
     # (siehe reservationswert); None = Einstand als Schwelle (Regel bis 1.3.4,
     # nur noch als Referenz im Selbsttest).
+    # frueh (1.5.0): Warte-Aufschlag in EUR/kWh je Stunde fuer die Wahl der
+    # PV-STUNDE. Der Greedy entscheidet wie bis 1.4.0 nach echter Marge, WAS
+    # passiert (welche Senke, Startinhalt oder Ladung, Netz oder PV); nur wenn
+    # seine Wahl eine PV-Ladung ist, nimmt er fuer dieselbe Senke die frueheste
+    # PV-Stunde, die hoechstens frueh je Stunde Abstand teurer ist. frueh 0 =
+    # Verhalten bis 1.4.0. Anlass 2026-09-27: Stunden 11 und 12 blieben RUHE
+    # und 1,04 kWh PV gingen ins Netz, weil die PV-Stunden 13 bis 15 um 0,1 ct
+    # billiger waren; der Plan wettete damit auf die Nachmittagssonne. Andre:
+    # "erst laden", Export bei vollem Akku ist das kleinere Uebel als ein
+    # halbvoller Abend. Ein Aufschlag auf ALLE Ladequellen verschob im Test
+    # die Nutzung des Startinhalts (Selbsttest 4b rot, ein Fall -1,8 ct/Tag),
+    # darum wirkt er nur zwischen PV-Stunden derselben Senke.
     # Voll-dynamischer, verlustfreier Stunden-Optimierer (greedy best-pair).
     # 1:1-Port aus batterie_schatten.ps1; Eingaben in Meter-kWh, SoC-Bahn in
     # gespeicherten kWh.
@@ -703,6 +728,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     for _ in range(MAX_ITER):
         best_marge = puffer - 1e-12
         best = None
+        pv_frueh = {}  # je Senke k: (Rang, Kandidat) der lohnenden PV-Quellen (1.5.0)
         for k in range(n):
             if not richtung_ok(k, "entladen"):
                 continue
@@ -749,8 +775,18 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
                             best_marge = m
                             best = {"art": quelle, "s": s, "k": k, "meter": raus / rt,
                                     "h_raus": h_raus, "e_raus": raus - h_raus}
+                        if quelle == "pv" and frueh > 0 and m > puffer - 1e-12:
+                            rang = m - frueh * s
+                            if k not in pv_frueh or rang > pv_frueh[k][0]:
+                                h_raus = min(bedarf[k], raus)
+                                pv_frueh[k] = (rang, {"art": "pv", "s": s, "k": k,
+                                                      "meter": raus / rt, "h_raus": h_raus,
+                                                      "e_raus": raus - h_raus})
         if best is None:
             break
+        if best["art"] == "pv" and best["k"] in pv_frueh:
+            # Warte-Aufschlag (1.5.0): gleiche Senke, frueheste PV-Stunde.
+            best = pv_frueh[best["k"]][1]
         k = best["k"]
         if best["art"] == "start":
             st = best["meter"] / sqrt_rt
@@ -1247,6 +1283,78 @@ def _selbsttest_kern():
         if ziel != soll or mn != soll_mn:
             fehler.append("Szenario 6: naechster_lauf(%s, takt %d) = (%s, %s), erwartet (%s, %s)."
                           % (nun, takt, ziel, mn, soll, soll_mn))
+
+    # Szenario 7 (1.5.0): Warte-Aufschlag. Tageslauf vom 2026-09-27 (echte
+    # Beurs, Akku 14,6 %): die PV-Stunden 11 und 12 sind um 0,1 ct teurer als
+    # 13 bis 15. Ohne Aufschlag (7b, Reihenfolge bis 1.4.0) laedt der Plan erst
+    # ab 13 Uhr und wettet auf die Nachmittagssonne; mit 0,3 ct/h (7a) muss er
+    # ab 11 Uhr laden, ohne Netzstrom und ohne spuerbaren Bilanzverlust.
+    # Gegenprobe 7c: sind 14 und 15 Uhr deutlich billiger (negative Beurs),
+    # wartet er trotz Aufschlag. 7d: Startinhalt bleibt unberuehrt (unten).
+    beurs7 = [0.2220, 0.2157, 0.2073, 0.2014, 0.1955, 0.1920, 0.1931, 0.1838,
+              0.1584, 0.0786, 0.0266, 0.0008, 0.0014, 0.0001, -0.0001, 0.0,
+              0.0159, 0.1389, 0.2300, 0.2446, 0.2434, 0.2298, 0.2145, 0.1980]
+    netto7 = ([0.3] * 8 + [0.4, 0.3, 0.0, -0.4, -0.7, -1.3, -1.7, -2.0, -1.8, -1.2,
+                           0.3, 0.6, 0.6, 0.5, 0.5, 0.4])
+    soc7 = 0.146 * KAP_KWH
+    ergebnis7 = {}
+    for variante, frueh7, negativ in (("7a", 0.003, False), ("7b", 0.0, False),
+                                      ("7c", 0.003, True)):
+        b = list(beurs7)
+        n7 = list(netto7)
+        if negativ:
+            b[14] = b[15] = -0.05
+            n7[14] = n7[15] = -2.5
+        imp7 = [x + 0.1327 for x in b]
+        ter7 = [wert_terug(b[h], h, cfg) for h in range(24)]
+        opt7 = optimiere(imp7, ter7, n7, soc7, einstand, rt, puffer, 800, fenster, None, frueh7)
+        fein7 = verbessere(opt7, imp7, ter7, n7, soc7, einstand, rt, puffer, 800, fenster)
+        sim7 = simuliere(fein7["struktur"], imp7, ter7, n7, soc7, einstand, rt, 800)
+        ergebnis7[variante] = sim7
+        if not sim7["ok"]:
+            fehler.append("Szenario %s: Simulator lehnt den Plan ab." % variante)
+        if abs(sim7["eur"] - fein7["eur"]) > 0.005:
+            fehler.append("Szenario %s: Simulator-Bilanz weicht ab (%.4f vs %.4f)."
+                          % (variante, sim7["eur"], fein7["eur"]))
+        pv_frueh = sim7["lad_pv"][11] + sim7["lad_pv"][12]
+        if variante == "7a":
+            if sim7["lad_pv"][11] < 0.3 or sim7["lad_pv"][12] < 0.5:
+                fehler.append("Szenario 7a: PV um 11/12 Uhr bleibt ungenutzt (%.2f / %.2f kWh), "
+                              "Warte-Aufschlag wirkt nicht."
+                              % (sim7["lad_pv"][11], sim7["lad_pv"][12]))
+            if sum(sim7["lad_netz"]) > 1e-6:
+                fehler.append("Szenario 7a: Netzladung trotz reichlich PV (%.2f kWh)."
+                              % sum(sim7["lad_netz"]))
+        elif variante == "7b":
+            if pv_frueh > 1e-6:
+                fehler.append("Szenario 7b: ohne Aufschlag laedt der Plan schon um 11/12 Uhr "
+                              "(%.2f kWh), Reihenfolge weicht von 1.4.0 ab." % pv_frueh)
+        elif pv_frueh > 1e-6:
+            fehler.append("Szenario 7c: trotz deutlich billigerer Stunden 14/15 laedt der Plan "
+                          "um 11/12 Uhr (%.2f kWh)." % pv_frueh)
+    if ergebnis7["7a"]["eur"] < ergebnis7["7b"]["eur"] - 0.02:
+        fehler.append("Szenario 7: frueh laden kostet mehr als 2 ct (%.4f vs %.4f EUR)."
+                      % (ergebnis7["7a"]["eur"], ergebnis7["7b"]["eur"]))
+    # 7d: der Aufschlag tauscht nur PV-Stunden und laesst die Entscheidungen
+    # um den Startinhalt stehen. Der erste Entwurf (Aufschlag auf alle
+    # Ladequellen) verkaufte in der Welt von 4b um 7 Uhr 0,65 kWh ohne
+    # billigen Nachkauf, die Abendreserve ging verloren.
+    b = [max(x, 0.19) if h >= 8 else x for h, x in enumerate(beurs2)]
+    imp7d = [x + 0.1327 for x in b]
+    ter7d = [wert_terug(b[h], h, cfg_aus) for h in range(24)]
+    res7d = reservationswert({"imp": list(imp7d), "ter": list(ter7d), "fehlt": [False] * 24},
+                             cfg_aus, fenster)
+    for h in range(7):
+        imp7d[h] = 999.0
+        ter7d[h] = -999.0
+    opt7d = optimiere(imp7d, ter7d, netto2, soc2, einstand2, rt, puffer, 800, fenster, res7d, 0.003)
+    fein7d = verbessere(opt7d, imp7d, ter7d, netto2, soc2, einstand2, rt, puffer, 800, fenster)
+    sim7d = simuliere(fein7d["struktur"], imp7d, ter7d, netto2, soc2, einstand2, rt, 800)
+    if not sim7d["ok"]:
+        fehler.append("Szenario 7d: Simulator lehnt den Plan ab.")
+    if sim7d["entl_haus"][7] + sim7d["entl_exp"][7] > 1e-6:
+        fehler.append("Szenario 7d: mit Warte-Aufschlag verkauft der Plan um 7 Uhr ohne billigen "
+                      "Nachkauf (%.2f kWh)." % (sim7d["entl_haus"][7] + sim7d["entl_exp"][7]))
     return fehler
 
 
@@ -1488,8 +1596,12 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     if reservation is None:
         reservation = einstand
         ref_name = "Einstand"
+    # Warte-Aufschlag (1.5.0): frueher laden schlaegt eine spaetere, kaum
+    # billigere Stunde; Option 0 = Reihenfolge wie bis 1.4.0.
+    frueh = frueh_aufschlag(opts)
     opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
-                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, reservation)
+                    cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, reservation,
+                    frueh)
     try:
         opt = verbessere(opt, pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
                          cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
@@ -1510,10 +1622,10 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     if soc_quelle != "live":
         soc_text += " aus %s" % soc_quelle
     log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %s, Einstand %.1f ct, "
-        "Halte-Schwelle %.1f ct aus %s, Saldering %s)"
+        "Halte-Schwelle %.1f ct aus %s, Saldering %s, Warte-Aufschlag %.2f ct/h)"
         % (anlass, plan_tag.strftime("%Y-%m-%d"), ab_stunde, opt["eur"],
            len(opt["trades"]), soc_text, einstand * 100, reservation * 100, ref_name,
-           "an" if cfg["saldering"] else "aus"))
+           "an" if cfg["saldering"] else "aus", frueh * 100))
     for t in opt["trades"]:
         log("  " + t)
     ergebnis = {"soc_ende": opt["soc"][23], "eur": opt["eur"]}
@@ -1619,9 +1731,9 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (6 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
+    log("Selbsttest bestanden (7 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
         "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe, "
-        "Zeitplan der Laeufe).")
+        "Zeitplan der Laeufe, Warte-Aufschlag mit Gegenproben und Startinhalt-Schutz).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
@@ -1639,8 +1751,9 @@ def main():
         raise SystemExit("HA-API nicht erreichbar, Abbruch.")
 
     log("Batterie-Planer v2 gestartet (Takt hh:%02d, Tageslauf 00:00:%02d, Vorschau Folgetag "
-        "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage)."
-        % (takt, MITTERNACHT_SEKUNDE, float(opts.get("einstand_start", 0.15)), profil_tage))
+        "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage, Warte-Aufschlag %.2f ct/h)."
+        % (takt, MITTERNACHT_SEKUNDE, float(opts.get("einstand_start", 0.15)), profil_tage,
+           frueh_aufschlag(opts) * 100))
 
     state = lade_json(STATE_PATH, {"tage": {}})
     if "tage" not in state:
