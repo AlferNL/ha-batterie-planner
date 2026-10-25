@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.1 (2026-10-25)
+
+- **DST-Sperre nur noch bis 02:00.** Am Umstelltag (25.10.2026, 25 Stunden)
+  setzte der Planer den ganzen Tag aus ("DST-Umstelltag, kein Plan fuer
+  heute"), schon die Vorschau am Vortag. Der Executor sah keinen Plan fuer
+  heute, der Fallback hielt den Akku in anti_feed, und der Akku ging leer
+  (12 %) in die Abendspitze, obwohl die Beurs bis 15 Uhr um 0 ct lag.
+  Unregelmaessig ist aber nur die Stunde 02 (Oktober doppelt, Maerz fehlt
+  sie); ab 03:00 hat der Tag normale Wanduhr-Stunden, und die Karten-
+  Schluessel "YYYY-MM-DD HH" sind eindeutig. Neue Funktion `dst_sperre`:
+  ausgesetzt werden nur Laeufe, die ab 02:00 oder frueher planen
+  (Tageslauf 00:00:30 und die Stundenlaeufe 00:48/01:48); der Lauf um 02:48
+  plant den Rest ab 03:00. Profil-Tage und Folgetag-Vorschau fuer einen
+  Umstelltag bleiben ausgespart wie bisher.
+- Trockenlauf gegen die echten HA-Daten vom 25.10. (Publishes abgefangen):
+  Plan ab 15:00 mit Netzladung 15/16 Uhr je 2000 W und anti_feed 17 bis
+  21 Uhr, Restbilanz -1,84 EUR; Tageslauf und 01:48-Lauf bleiben gesperrt.
+- Selbsttest um Szenario 8 erweitert (25.10.2026 und 28.03.2027 sperren nur
+  bis 02:00, Nachbartage nie).
+
+
 ## 1.5.0 (2026-09-27)
 
 - **Warte-Aufschlag fuer die PV-Stunde** (neue Option `frueh_ct_je_stunde`,

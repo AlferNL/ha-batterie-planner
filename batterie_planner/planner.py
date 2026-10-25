@@ -69,6 +69,11 @@ STATUS_TOPIC_BASIS = "brainwiki/batterie/v2planner"
 # Sensorwechsel und ohnehin um hh:01.
 MITTERNACHT_SEKUNDE = 30
 
+# Zeitumstellung (EU): die Stunde 02 Ortszeit kommt im Oktober doppelt vor und
+# fehlt im Maerz. Laeufe, die ab dieser Stunde oder frueher planen, setzen am
+# Umstelltag aus (1.5.1); der Resttag ab 03:00 wird normal geplant.
+DST_STUNDE = 2
+
 ZAEHLER = {
     "imp": "sensor.p1_meter_energy_import",
     "exp": "sensor.p1_meter_energy_export",
@@ -464,6 +469,15 @@ def einstand_pflegen(state, cfg, karte, offset, karte_ne=None):
 
 def ist_dst_tag(tag0):
     return tag0.utcoffset() != (tag0 + timedelta(days=1)).utcoffset()
+
+
+def dst_sperre(tag0, ab_stunde):
+    # 1.5.1: Am Umstelltag ist nur die Stunde 02 unregelmaessig (Oktober
+    # doppelt, Maerz fehlt sie), der Schluessel "YYYY-MM-DD 02" der Preis- und
+    # Solcast-Karten ist dann mehrdeutig. Ab 03:00 hat der Tag normale
+    # Wanduhr-Stunden; bis 1.5.0 fiel trotzdem der ganze Tag in den Fallback
+    # (2026-10-25: kein Plan, Akku leer in die Abendspitze).
+    return ist_dst_tag(tag0) and ab_stunde <= DST_STUNDE
 
 
 def solcast_stunden(entity, tag0, feld):
@@ -1355,6 +1369,26 @@ def _selbsttest_kern():
     if sim7d["entl_haus"][7] + sim7d["entl_exp"][7] > 1e-6:
         fehler.append("Szenario 7d: mit Warte-Aufschlag verkauft der Plan um 7 Uhr ohne billigen "
                       "Nachkauf (%.2f kWh)." % (sim7d["entl_haus"][7] + sim7d["entl_exp"][7]))
+
+    # Szenario 8 (1.5.1): DST-Sperre nur bis zur Umstellstunde. 25.10.2026
+    # (25 Stunden) und 28.03.2027 (23 Stunden) setzen nur Laeufe ab <= 02:00
+    # aus, normale Tage nie.
+    if ZoneInfo is not None:
+        ams = ZoneInfo("Europe/Amsterdam")
+        faelle8 = [
+            (datetime(2026, 10, 25, tzinfo=ams), 0, True),
+            (datetime(2026, 10, 25, tzinfo=ams), 2, True),
+            (datetime(2026, 10, 25, tzinfo=ams), 3, False),
+            (datetime(2026, 10, 25, tzinfo=ams), 16, False),
+            (datetime(2027, 3, 28, tzinfo=ams), 2, True),
+            (datetime(2027, 3, 28, tzinfo=ams), 4, False),
+            (datetime(2026, 10, 24, tzinfo=ams), 0, False),
+            (datetime(2026, 10, 26, tzinfo=ams), 0, False),
+        ]
+        for (tag0, ab, soll) in faelle8:
+            if dst_sperre(tag0, ab) != soll:
+                fehler.append("Szenario 8: dst_sperre(%s, ab %d) = %s, erwartet %s."
+                              % (tag0.date(), ab, not soll, soll))
     return fehler
 
 
@@ -1663,9 +1697,10 @@ def plan_heute(state, opts, voll=False):
     if ab >= 24:
         log("PlanHeute: Tag vorbei, nichts mehr zu planen.")
         return
-    if ist_dst_tag(tag0):
-        log("WARNUNG: DST-Umstelltag, kein Tagesplan.")
-        publiziere_status("warnung", "DST-Umstelltag, kein Plan fuer heute.")
+    if dst_sperre(tag0, ab):
+        log("WARNUNG: DST-Umstelltag, kein Plan ab %02d:00 (erst ab %02d:00 regulaer)."
+            % (ab, DST_STUNDE + 1))
+        publiziere_status("warnung", "DST-Umstelltag, Plan erst ab %02d:00." % (DST_STUNDE + 1))
         return
     erg = rechne_und_publiziere(tag0, ab, "sensor.solcast_pv_forecast_prognose_heute",
                                 "pv_estimate", state, opts, "PLAN TAG" if voll else "PLAN HEUTE")
@@ -1731,9 +1766,10 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (7 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
+    log("Selbsttest bestanden (8 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
         "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe, "
-        "Zeitplan der Laeufe, Warte-Aufschlag mit Gegenproben und Startinhalt-Schutz).")
+        "Zeitplan der Laeufe, Warte-Aufschlag mit Gegenproben und Startinhalt-Schutz, "
+        "DST-Sperre nur bis 02:00).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
