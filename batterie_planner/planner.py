@@ -19,7 +19,7 @@
 # Publiziert wird nur, wenn sich der Restplan wirklich aendert (Flatter-Bremse).
 #
 # Notbremse: jeder fertige Plan muss harte Invarianten bestehen (Entladung nie
-# ueber 800 W, Ladung 250..2000 W, kein Handel auf gesperrten Preisstunden,
+# ueber 800 W, Ladung 250..netz_lade_max_w, kein Handel auf gesperrten Preisstunden,
 # SoC-Bahn in den Grenzen). Bei Verstoss wird NICHT publiziert, nur gemeldet -
 # der letzte gueltige Plan bleibt retained stehen.
 #
@@ -47,7 +47,7 @@ except ImportError:
 KAP_KWH = 5.12            # Marstek Venus E, nutzbare Nennkapazitaet
 BODEN_PCT = 12.3          # E7-Boden: darunter gilt der Akku als leer
 ENTL_MAX_W_HART = 800     # Andres harte Vorgabe: NIE mehr
-LADEN_NETZ_MAX_W = 2000   # obere Klemme der Zwangsladung
+LADEN_NETZ_MAX_W = 2000   # Default der Option netz_lade_max_w (obere Klemme der Zwangsladung)
 LADEN_PV_MAX_W = 2500     # Hardware-Maximum Laden
 MAX_ITER = 500            # Notbremse Optimierer
 
@@ -236,6 +236,7 @@ def lese_konfig():
     cfg["puffer"] = zahl("input_number.gate_puffer", 0.01)
     entl_ha = zahl("number.marstek_venus_modbus_maximale_entladeleistung", 800)
     cfg["entl_max_w"] = min(ENTL_MAX_W_HART, int(entl_ha)) if entl_ha > 0 else ENTL_MAX_W_HART
+    cfg["lad_max_ha"] = zahl("number.marstek_venus_modbus_maximale_ladeleistung", LADEN_PV_MAX_W)
     cfg["v_faktor"] = 1.0
     if cfg["jahr_kwh"] > cfg["bonus_cap"] and cfg["jahr_kwh"] > 0:
         cfg["v_faktor"] = cfg["bonus_cap"] / cfg["jahr_kwh"]
@@ -634,6 +635,22 @@ def frueh_aufschlag(opts):
     return max(0.0, wert) / 100.0
 
 
+def netz_lade_max(opts, ha_max=None):
+    # Option netz_lade_max_w (1.6.0): obere Klemme der Zwangsladung aus dem Netz
+    # in W. Bis 1.5.1 fest 2000 W, eine Zahl aus dem Wirkungsgrad-Test vom
+    # 2026-08-24, keine Hardware-Grenze (Marstek bis 2500 W, Anschluss 1x35A).
+    # Geklemmt auf 250..LADEN_PV_MAX_W und auf den Maximalwert der Marstek in
+    # HA, falls lesbar; unlesbar faellt auf den Default zurueck.
+    try:
+        wert = int(float(opts.get("netz_lade_max_w", LADEN_NETZ_MAX_W)))
+    except (TypeError, ValueError):
+        wert = LADEN_NETZ_MAX_W
+    wert = min(LADEN_PV_MAX_W, max(250, wert))
+    if ha_max is not None and ha_max > 0:
+        wert = min(wert, max(250, int(ha_max)))
+    return wert
+
+
 def reservationswert(pk, cfg, export_ok):
     # Wert einer GESPEICHERTEN kWh ueber den Planhorizont hinaus (1.3.5), EUR/kWh.
     # Der Einstand ist bezahlt (Sunk Cost) und taugt nicht als Verkaufsgrenze:
@@ -664,7 +681,7 @@ def reservationswert(pk, cfg, export_ok):
 
 
 def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_max_w,
-              export_ok=None, reservation=None, frueh=0.0):
+              export_ok=None, reservation=None, frueh=0.0, lad_netz_max_w=LADEN_NETZ_MAX_W):
     # export_ok: je Stunde True/False, ob Entladung ueber den Hausbedarf hinaus
     # (Export aus dem Akku) erlaubt ist; None = ueberall erlaubt. Andre
     # 2026-09-03: Export nur im Zonnebonus-Fenster, sonst Nulleinspeisung.
@@ -683,6 +700,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     # halbvoller Abend. Ein Aufschlag auf ALLE Ladequellen verschob im Test
     # die Nutzung des Startinhalts (Selbsttest 4b rot, ein Fall -1,8 ct/Tag),
     # darum wirkt er nur zwischen PV-Stunden derselben Senke.
+    # lad_netz_max_w (1.6.0): Netzladung je Stunde in W, Option netz_lade_max_w.
     # Voll-dynamischer, verlustfreier Stunden-Optimierer (greedy best-pair).
     # 1:1-Port aus batterie_schatten.ps1; Eingaben in Meter-kWh, SoC-Bahn in
     # gespeicherten kWh.
@@ -690,7 +708,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     sqrt_rt = math.sqrt(rt)
     boden = KAP_KWH * BODEN_PCT / 100.0
     entl_max = entl_max_w / 1000.0
-    lad_netz = LADEN_NETZ_MAX_W / 1000.0
+    lad_netz = lad_netz_max_w / 1000.0
     lad_pv = LADEN_PV_MAX_W / 1000.0
 
     halte = einstand_start if reservation is None else reservation
@@ -850,14 +868,15 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
             "trades": trades, "struktur": struktur}
 
 
-def simuliere(struktur, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w):
+def simuliere(struktur, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w,
+              lad_netz_max_w=LADEN_NETZ_MAX_W):
     # Spielt eine Trade-Liste von Null durch und prueft ALLE Grenzen unabhaengig
     # vom Greedy. Rueckgabe hat dieselbe Form wie optimiere() plus "ok".
     n = len(netto)
     sqrt_rt = math.sqrt(rt)
     boden = KAP_KWH * BODEN_PCT / 100.0
     entl_max = entl_max_w / 1000.0
-    lad_netz = LADEN_NETZ_MAX_W / 1000.0
+    lad_netz = lad_netz_max_w / 1000.0
     lad_pv = LADEN_PV_MAX_W / 1000.0
     bedarf0 = [max(0.0, x) for x in netto]
     pv_frei0 = [max(0.0, -x) for x in netto]
@@ -935,7 +954,7 @@ def simuliere(struktur, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w
 
 
 def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_max_w,
-               export_ok=None):
+               export_ok=None, lad_netz_max_w=LADEN_NETZ_MAX_W):
     # Umschicht-Pass gegen die Greedy-Luecke (Anlass 2026-09-01): Energie, die im
     # Akku ueber eine teure fruehe Stunde k1 hinweg fuer eine spaetere Stunde k2
     # gebucht ist, wird bei k1 verkauft und fuer k2 in einer billigen Stunde s
@@ -945,11 +964,12 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
     n = len(netto)
     sqrt_rt = math.sqrt(rt)
     entl_max = entl_max_w / 1000.0
-    lad_netz = LADEN_NETZ_MAX_W / 1000.0
+    lad_netz = lad_netz_max_w / 1000.0
     lad_pv = LADEN_PV_MAX_W / 1000.0
     bedarf0 = [max(0.0, x) for x in netto]
 
-    basis = simuliere(opt["struktur"], imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w)
+    basis = simuliere(opt["struktur"], imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w,
+                      lad_netz_max_w)
     if not basis["ok"] or abs(basis["eur"] - opt["eur"]) > 1e-3:
         log("WARNUNG: Simulator weicht vom Greedy ab (%.4f vs %.4f), Umschicht-Pass uebersprungen."
             % (basis["eur"], opt["eur"]))
@@ -1067,7 +1087,8 @@ def verbessere(opt, imp, ter, netto, soc_start_kwh, einstand, rt, puffer, entl_m
                             "senke": senke1, "meter": teil / rt})
         neu.append({"art": kandidat["nach_art"], "s": kandidat["s"], "k": t["k"],
                     "senke": t["senke"], "meter": raus / rt})
-        probe = simuliere(neu, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w)
+        probe = simuliere(neu, imp, ter, netto, soc_start_kwh, einstand, rt, entl_max_w,
+                          lad_netz_max_w)
         if not probe["ok"] or probe["eur"] <= best["eur"] + 0.005:
             verworfen.add(kandidat["key"])
             continue
@@ -1389,6 +1410,66 @@ def _selbsttest_kern():
             if dst_sperre(tag0, ab) != soll:
                 fehler.append("Szenario 8: dst_sperre(%s, ab %d) = %s, erwartet %s."
                               % (tag0.date(), ab, not soll, soll))
+
+    # Szenario 9 (1.6.0): Netzladung als Option. Leerer Akku, zwei billige
+    # Stunden (12/13), Abendbedarf 17-21 Uhr ueber 800 W, sonst kein Handel
+    # (Rest des Tages teurer als Abendwert mal rt, kein Export). Mit dem
+    # Default 2000 W (9a) bleibt jede Stunde bei 2 kWh und der Akku wird im Tal
+    # nicht voll; mit 2500 W (9b) laedt er mehr, die Bilanz steigt, Plan und
+    # Notbremse folgen der Option, und die Default-Notbremse lehnt 2500 W ab.
+    for (o, ha, soll) in (({}, None, 2000), ({"netz_lade_max_w": 2500}, None, 2500),
+                          ({"netz_lade_max_w": 2500}, 2200, 2200),
+                          ({"netz_lade_max_w": 9000}, None, 2500),
+                          ({"netz_lade_max_w": 100}, None, 250),
+                          ({"netz_lade_max_w": "x"}, None, 2000)):
+        if netz_lade_max(o, ha) != soll:
+            fehler.append("Szenario 9: netz_lade_max(%s, %s) = %d, erwartet %d."
+                          % (o, ha, netz_lade_max(o, ha), soll))
+    beurs9 = [0.36] * 24
+    beurs9[12] = beurs9[13] = 0.0
+    for h in range(17, 22):
+        beurs9[h] = 0.40
+    imp9 = [x + 0.1327 for x in beurs9]
+    ter9 = [wert_terug(beurs9[h], h, cfg) for h in range(24)]
+    netto9 = [0.0] * 24
+    for h in range(17, 22):
+        netto9[h] = 0.9
+    kein_export = [False] * 24
+    soc9 = KAP_KWH * BODEN_PCT / 100.0
+    ergebnis9 = {}
+    for variante, lad_w in (("9a", None), ("9b", 2500)):
+        extra = {} if lad_w is None else {"lad_netz_max_w": lad_w}
+        grenze = (LADEN_NETZ_MAX_W if lad_w is None else lad_w) / 1000.0
+        opt9 = optimiere(imp9, ter9, netto9, soc9, einstand, rt, puffer, 800, kein_export,
+                         **extra)
+        fein9 = verbessere(opt9, imp9, ter9, netto9, soc9, einstand, rt, puffer, 800,
+                           kein_export, **extra)
+        sim9 = simuliere(fein9["struktur"], imp9, ter9, netto9, soc9, einstand, rt, 800, **extra)
+        ergebnis9[variante] = (fein9, sim9)
+        if not sim9["ok"]:
+            fehler.append("Szenario %s: Simulator lehnt den Plan ab." % variante)
+        if abs(sim9["eur"] - fein9["eur"]) > 0.005:
+            fehler.append("Szenario %s: Simulator-Bilanz weicht ab (%.4f vs %.4f)."
+                          % (variante, sim9["eur"], fein9["eur"]))
+        for h in range(24):
+            if sim9["lad_netz"][h] > grenze + 1e-6:
+                fehler.append("Szenario %s: Stunde %d laedt %.2f kWh ueber der Grenze %.1f."
+                              % (variante, h, sim9["lad_netz"][h], grenze))
+    fein9a, sim9a = ergebnis9["9a"]
+    fein9b, sim9b = ergebnis9["9b"]
+    if sum(sim9b["lad_netz"]) < sum(sim9a["lad_netz"]) + 0.5:
+        fehler.append("Szenario 9b: 2500 W laden nicht mehr ins Tal (%.2f vs %.2f kWh)."
+                      % (sum(sim9b["lad_netz"]), sum(sim9a["lad_netz"])))
+    if fein9b["eur"] < fein9a["eur"] + 0.1:
+        fehler.append("Szenario 9b: 2500 W bringen keinen Gewinn (%.4f vs %.4f EUR)."
+                      % (fein9b["eur"], fein9a["eur"]))
+    akt9b = plan_aktionen(fein9b, 0, 800, 2500)
+    if max(a["watt"] for a in akt9b if a["aktion"] == "ZWANGSLADUNG") <= LADEN_NETZ_MAX_W:
+        fehler.append("Szenario 9b: Plan schickt keine Ladung ueber %d W." % LADEN_NETZ_MAX_W)
+    if pruefe_invarianten(akt9b, fein9b, [False] * 24, 0, 800, soc9, 2500):
+        fehler.append("Szenario 9b: Notbremse lehnt einen gueltigen 2500-W-Plan ab.")
+    if not pruefe_invarianten(akt9b, fein9b, [False] * 24, 0, 800, soc9):
+        fehler.append("Szenario 9b: Default-Notbremse laesst 2500 W durch.")
     return fehler
 
 
@@ -1406,7 +1487,7 @@ def selbsttest():
 
 
 # ------------------------------------------------------- Plan bauen und pruefen
-def plan_aktionen(opt, ab_stunde, entl_max_w):
+def plan_aktionen(opt, ab_stunde, entl_max_w, lad_netz_max_w=LADEN_NETZ_MAX_W):
     aktionen = []
     for h in range(24):
         akt = "RUHE"
@@ -1418,7 +1499,7 @@ def plan_aktionen(opt, ab_stunde, entl_max_w):
             ent_m = opt["entl_haus"][h] + opt["entl_exp"][h]
             if opt["lad_netz"][h] > 0.01:
                 akt = "ZWANGSLADUNG"
-                watt = min(LADEN_NETZ_MAX_W, max(250, round(lad_m * 1000 / 50) * 50))
+                watt = min(lad_netz_max_w, max(250, round(lad_m * 1000 / 50) * 50))
             elif opt["entl_exp"][h] > 0.01:
                 akt = "ZWANGSENTLADUNG"
                 watt = min(entl_max_w, max(100, round(ent_m * 1000 / 50) * 50))
@@ -1428,7 +1509,8 @@ def plan_aktionen(opt, ab_stunde, entl_max_w):
     return aktionen
 
 
-def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kwh):
+def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kwh,
+                       lad_netz_max_w=LADEN_NETZ_MAX_W):
     # Notbremse vor jedem Publish: bei Verstoss wird NICHT publiziert.
     fehler = []
     if len(aktionen) != 24:
@@ -1440,9 +1522,9 @@ def pruefe_invarianten(aktionen, opt, fehlt, ab_stunde, entl_max_w, soc_start_kw
                 fehler.append("Stunde %d: Entladung %d W ausserhalb 100..%d."
                               % (a["h"], a["watt"], min(ENTL_MAX_W_HART, entl_max_w)))
         if a["aktion"] == "ZWANGSLADUNG":
-            if a["watt"] > LADEN_NETZ_MAX_W or a["watt"] < 250:
+            if a["watt"] > lad_netz_max_w or a["watt"] < 250:
                 fehler.append("Stunde %d: Ladung %d W ausserhalb 250..%d."
-                              % (a["h"], a["watt"], LADEN_NETZ_MAX_W))
+                              % (a["h"], a["watt"], lad_netz_max_w))
         if a["h"] >= ab_stunde and fehlt[a["h"]] and a["aktion"] not in ("RUHE", "VORBEI"):
             fehler.append("Stunde %d: Aktion %s trotz gesperrtem Preis."
                           % (a["h"], a["aktion"]))
@@ -1633,17 +1715,20 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     # Warte-Aufschlag (1.5.0): frueher laden schlaegt eine spaetere, kaum
     # billigere Stunde; Option 0 = Reihenfolge wie bis 1.4.0.
     frueh = frueh_aufschlag(opts)
+    # Netzladung je Stunde (1.6.0): Option netz_lade_max_w, gekappt am HA-Maximum.
+    lad_max_w = netz_lade_max(opts, cfg["lad_max_ha"])
     opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
                     cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, reservation,
-                    frueh)
+                    frueh, lad_max_w)
     try:
         opt = verbessere(opt, pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
-                         cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok)
+                         cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, lad_max_w)
     except Exception as e:
         log("WARNUNG: Umschicht-Pass abgebrochen (%s), Greedy-Plan gilt." % e)
-    aktionen = plan_aktionen(opt, ab_stunde, cfg["entl_max_w"])
+    aktionen = plan_aktionen(opt, ab_stunde, cfg["entl_max_w"], lad_max_w)
 
-    fehler = pruefe_invarianten(aktionen, opt, pk["fehlt"], ab_stunde, cfg["entl_max_w"], soc_start_kwh)
+    fehler = pruefe_invarianten(aktionen, opt, pk["fehlt"], ab_stunde, cfg["entl_max_w"], soc_start_kwh,
+                                lad_max_w)
     if fehler:
         detail = "%s: Invarianten verletzt, Plan NICHT publiziert: %s" % (anlass, " | ".join(fehler))
         log("FEHLER: " + detail)
@@ -1656,10 +1741,10 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     if soc_quelle != "live":
         soc_text += " aus %s" % soc_quelle
     log("%s %s ab %02d:00: %+.2f EUR Restbilanz, %d Trades (SoC %s, Einstand %.1f ct, "
-        "Halte-Schwelle %.1f ct aus %s, Saldering %s, Warte-Aufschlag %.2f ct/h)"
+        "Halte-Schwelle %.1f ct aus %s, Saldering %s, Warte-Aufschlag %.2f ct/h, Netzladung max %d W)"
         % (anlass, plan_tag.strftime("%Y-%m-%d"), ab_stunde, opt["eur"],
            len(opt["trades"]), soc_text, einstand * 100, reservation * 100, ref_name,
-           "an" if cfg["saldering"] else "aus", frueh * 100))
+           "an" if cfg["saldering"] else "aus", frueh * 100, lad_max_w))
     for t in opt["trades"]:
         log("  " + t)
     ergebnis = {"soc_ende": opt["soc"][23], "eur": opt["eur"]}
@@ -1766,10 +1851,10 @@ def main():
             log("SELBSTTEST FEHLGESCHLAGEN: %s" % f)
         raise SystemExit("Selbsttest fehlgeschlagen, Add-on stoppt OHNE Publish "
                          "(alter retained Plan bleibt stehen).")
-    log("Selbsttest bestanden (8 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
+    log("Selbsttest bestanden (9 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
         "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe, "
         "Zeitplan der Laeufe, Warte-Aufschlag mit Gegenproben und Startinhalt-Schutz, "
-        "DST-Sperre nur bis 02:00).")
+        "DST-Sperre nur bis 02:00, Netzladung als Option mit Notbremse).")
     opts = lade_json(OPTIONS_PATH, {})
     takt = int(opts.get("takt_minute", 55))
     profil_tage = int(opts.get("profil_tage", 14))
@@ -1787,9 +1872,10 @@ def main():
         raise SystemExit("HA-API nicht erreichbar, Abbruch.")
 
     log("Batterie-Planer v2 gestartet (Takt hh:%02d, Tageslauf 00:00:%02d, Vorschau Folgetag "
-        "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage, Warte-Aufschlag %.2f ct/h)."
+        "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage, Warte-Aufschlag %.2f ct/h, "
+        "Netzladung max %d W)."
         % (takt, MITTERNACHT_SEKUNDE, float(opts.get("einstand_start", 0.15)), profil_tage,
-           frueh_aufschlag(opts) * 100))
+           frueh_aufschlag(opts) * 100, netz_lade_max(opts)))
 
     state = lade_json(STATE_PATH, {"tage": {}})
     if "tage" not in state:

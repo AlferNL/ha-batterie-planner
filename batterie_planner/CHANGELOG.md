@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0 (2026-10-30)
+
+- **Netzladung als Option** (neue Option `netz_lade_max_w`, Default 2000 W,
+  erlaubt 250 bis 2500). Bis 1.5.1 war die Zwangsladung fest auf 2000 W
+  geklemmt (`LADEN_NETZ_MAX_W`). Die Zahl stammt aus dem Wirkungsgrad-Test
+  vom 2026-08-24 (2000 W als Winterfenster-Leistung) und wanderte ungeprueft
+  in v1, v2 und das Add-on; sie ist keine Hardware-Grenze (Marstek bis
+  2500 W, Anschluss 1x35A). Andre 2026-10-30: "Warum eigentlich nur 2000,
+  die Marstek kann bis 2500". Die Option wirkt in Greedy, Umschicht-Pass,
+  Simulator, Plan-Watt und Notbremse; zusaetzlich gekappt am HA-Maximum
+  `number.marstek_venus_modbus_maximale_ladeleistung`. Start- und Laufzeile
+  im Log nennen den Wert.
+- Wirkung: in einem kurzen, tiefen Preistal laedt der Akku weiter (zwei
+  Stunden mit 2000 W fuellen rund 80 %, mit 2500 W voll). Trockenlauf gegen
+  die echten HA-Daten vom 30.10. (Publishes abgefangen): ganzer Tag
+  -4,23 auf -4,20 EUR, Resttag ab 13:00 -0,40 auf -0,37 EUR; die Preise
+  10/11 Uhr lagen kaum ueber 12/13 Uhr, darum nur rund 3 ct.
+- Selbsttest um Szenario 9 erweitert (Klemmung der Option, Default bleibt
+  bei 2000 W je Stunde, 2500 W laden mehr ins Tal mit besserer Bilanz,
+  Plan und Notbremse folgen der Option, die Default-Notbremse lehnt 2500 W ab).
+
+
 ## 1.5.1 (2026-10-25)
 
 - **DST-Sperre nur noch bis 02:00.** Am Umstelltag (25.10.2026, 25 Stunden)
