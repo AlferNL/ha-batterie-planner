@@ -15,7 +15,7 @@ Stuendlicher Batterie-Fahrplan (rolling horizon) fuer die Marstek-v2-Steuerung.
   Kein fester Zeitpunkt, die Daten selbst loesen aus. Die Vorschau ist reine
   Anzeige: das Haus faehrt nur `sensor.batterie_v2_plan`.
 - Notbremse: verletzt ein Plan die harten Invarianten (Entladung ueber 800 W,
-  Ladung ausserhalb 250 W bis `netz_lade_max_w`, Handel auf gesperrten Preisstunden, SoC-Bahn
+  Ladung ausserhalb 250 W bis B1 max. Ladeleistung, Handel auf gesperrten Preisstunden, SoC-Bahn
   ausserhalb der Grenzen), wird NICHT publiziert, nur gemeldet; der letzte
   gueltige Plan bleibt retained stehen.
 - Status-Sensor: `sensor.batterie_v2_planner_status` (ok / warnung / fehler,
@@ -29,12 +29,22 @@ Stuendlicher Batterie-Fahrplan (rolling horizon) fuer die Marstek-v2-Steuerung.
 | `sensor.batterie_v2_plan_morgen` | `brainwiki/batterie/v2plan_morgen` | Folgetag-Vorschau, Attribute `start_soc_pct` und `start_soc_quelle` (Heute-Plan-Ende oder live) |
 | `sensor.batterie_v2_planner_status` | `brainwiki/batterie/v2planner` | Laufstatus des Hauptplans |
 
-## Optionen
+## Option
 
 | Option | Default | Bedeutung |
 |---|---|---|
 | `einstand_start` | 0.15 | EUR/kWh Startwert; danach fuehrt das Add-on den echten gewichteten Einkaufspreis der gespeicherten Energie selbst im State mit |
-| `profil_tage` | 14 | Tage im Median-Hauslastprofil (die juengsten Tage mit Daten; 6 weitere bleiben nur als Vorrat im State) |
-| `takt_minute` | 55 | Minute des stuendlichen Planungslaufs |
-| `frueh_ct_je_stunde` | 0.3 | Warte-Aufschlag (seit 1.5.0) in ct/kWh je Stunde: unter den PV-Stunden fuer dieselbe Entladung gewinnt die frueheste, eine spaetere nur, wenn sie je Stunde Abstand mehr als diesen Wert billiger ist. 0 = Reihenfolge wie bis 1.4.0 |
-| `netz_lade_max_w` | 2000 | Hoechste Zwangsladung aus dem Netz je Stunde in W (seit 1.6.0, bis dahin fest 2000). Erlaubt 250 bis 2500, zusaetzlich gekappt an `number.marstek_venus_modbus_maximale_ladeleistung`. Mehr Leistung fuellt den Akku in einem kurzen Preistal weiter (zwei Stunden mit 2000 W rund 80 %, mit 2500 W voll) |
+
+## Regler in Home Assistant (seit 1.7.0)
+
+Die uebrigen Einstellungen liest der Planer in jedem Lauf aus HA, sie stehen im
+Config-Dashboard (pv-prognose, Ansicht Konfig, Abschnitt Batterie-Planer v2) und
+wirken ab dem naechsten Lauf ohne Neustart. Ist ein Helfer unlesbar, gilt sein
+letzter gelesener Wert, beim ersten Lauf der Default (mit WARNUNG im Log).
+
+| Entity | Default | Bedeutung |
+|---|---|---|
+| `input_number.planer_warte_aufschlag` | 0.3 | Warte-Aufschlag (seit 1.5.0) in ct/kWh je Stunde: unter den PV-Stunden fuer dieselbe Entladung gewinnt die frueheste, eine spaetere nur, wenn sie je Stunde Abstand mehr als diesen Wert billiger ist. 0 = Reihenfolge wie bis 1.4.0 |
+| `input_number.planer_profiltage` | 14 | Tage im Median-Hauslastprofil (die juengsten Tage mit Daten; 6 weitere bleiben nur als Vorrat im State). Eine Aenderung fuellt den Vorrat sofort nach |
+| `input_number.planer_takt_minute` | 55 | Minute des stuendlichen Planungslaufs; eine Aenderung greift ab dem uebernaechsten Lauf |
+| `number.marstek_venus_modbus_maximale_ladeleistung` | 2000 (unlesbar) | Hoechste Zwangsladung aus dem Netz je Stunde in W, wie bei der Entladung der Wert der Marstek selbst (Dashboard: B1 max. Ladeleistung), geklemmt auf 250 bis 2500. Mehr Leistung fuellt den Akku in einem kurzen Preistal weiter (zwei Stunden mit 2000 W rund 80 %, mit 2500 W voll) |

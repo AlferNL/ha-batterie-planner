@@ -19,7 +19,7 @@
 # Publiziert wird nur, wenn sich der Restplan wirklich aendert (Flatter-Bremse).
 #
 # Notbremse: jeder fertige Plan muss harte Invarianten bestehen (Entladung nie
-# ueber 800 W, Ladung 250..netz_lade_max_w, kein Handel auf gesperrten Preisstunden,
+# ueber 800 W, Ladung 250..B1 max. Ladeleistung, kein Handel auf gesperrten Preisstunden,
 # SoC-Bahn in den Grenzen). Bei Verstoss wird NICHT publiziert, nur gemeldet -
 # der letzte gueltige Plan bleibt retained stehen.
 #
@@ -47,7 +47,7 @@ except ImportError:
 KAP_KWH = 5.12            # Marstek Venus E, nutzbare Nennkapazitaet
 BODEN_PCT = 12.3          # E7-Boden: darunter gilt der Akku als leer
 ENTL_MAX_W_HART = 800     # Andres harte Vorgabe: NIE mehr
-LADEN_NETZ_MAX_W = 2000   # Default der Option netz_lade_max_w (obere Klemme der Zwangsladung)
+LADEN_NETZ_MAX_W = 2000   # Rueckfall der Netzladung, wenn B1 max. Ladeleistung unlesbar ist
 LADEN_PV_MAX_W = 2500     # Hardware-Maximum Laden
 MAX_ITER = 500            # Notbremse Optimierer
 
@@ -236,7 +236,7 @@ def lese_konfig():
     cfg["puffer"] = zahl("input_number.gate_puffer", 0.01)
     entl_ha = zahl("number.marstek_venus_modbus_maximale_entladeleistung", 800)
     cfg["entl_max_w"] = min(ENTL_MAX_W_HART, int(entl_ha)) if entl_ha > 0 else ENTL_MAX_W_HART
-    cfg["lad_max_ha"] = zahl("number.marstek_venus_modbus_maximale_ladeleistung", LADEN_PV_MAX_W)
+    cfg["lad_max_ha"] = zahl("number.marstek_venus_modbus_maximale_ladeleistung", -1)
     cfg["v_faktor"] = 1.0
     if cfg["jahr_kwh"] > cfg["bonus_cap"] and cfg["jahr_kwh"] > 0:
         cfg["v_faktor"] = cfg["bonus_cap"] / cfg["jahr_kwh"]
@@ -635,20 +635,51 @@ def frueh_aufschlag(opts):
     return max(0.0, wert) / 100.0
 
 
-def netz_lade_max(opts, ha_max=None):
-    # Option netz_lade_max_w (1.6.0): obere Klemme der Zwangsladung aus dem Netz
-    # in W. Bis 1.5.1 fest 2000 W, eine Zahl aus dem Wirkungsgrad-Test vom
-    # 2026-08-24, keine Hardware-Grenze (Marstek bis 2500 W, Anschluss 1x35A).
-    # Geklemmt auf 250..LADEN_PV_MAX_W und auf den Maximalwert der Marstek in
-    # HA, falls lesbar; unlesbar faellt auf den Default zurueck.
+def netz_lade_max(ha_max):
+    # Obere Klemme der Zwangsladung aus dem Netz in W. Bis 1.5.1 fest 2000 W,
+    # eine Zahl aus dem Wirkungsgrad-Test vom 2026-08-24, keine Hardware-Grenze
+    # (Marstek bis 2500 W, Anschluss 1x35A). 1.6.0 machte sie zur Add-on-Option,
+    # seit 1.7.0 gilt wie bei der Entladung der Wert der Marstek selbst
+    # (number.marstek_venus_modbus_maximale_ladeleistung, im Config-Dashboard
+    # "B1 max. Ladeleistung"), geklemmt auf 250..LADEN_PV_MAX_W. Unlesbar faellt
+    # auf LADEN_NETZ_MAX_W zurueck.
     try:
-        wert = int(float(opts.get("netz_lade_max_w", LADEN_NETZ_MAX_W)))
+        wert = int(float(ha_max))
     except (TypeError, ValueError):
-        wert = LADEN_NETZ_MAX_W
-    wert = min(LADEN_PV_MAX_W, max(250, wert))
-    if ha_max is not None and ha_max > 0:
-        wert = min(wert, max(250, int(ha_max)))
-    return wert
+        wert = -1
+    if wert <= 0:
+        return LADEN_NETZ_MAX_W
+    return min(LADEN_PV_MAX_W, max(250, wert))
+
+
+# Planer-Regler aus HA (1.7.0): stehen im Config-Dashboard pv-prognose (Ansicht
+# Konfig, Abschnitt Batterie-Planer v2) und wirken ab dem naechsten Lauf, ohne
+# Add-on-Neustart. Bis 1.6.0 waren es Add-on-Optionen. Je Regler: Entity,
+# Default, Grenzen, Ganzzahl ja/nein.
+REGLER = {
+    "frueh_ct_je_stunde": ("input_number.planer_warte_aufschlag", FRUEH_CT_DEFAULT, 0.0, 5.0, False),
+    "profil_tage": ("input_number.planer_profiltage", 14, 1, 30, True),
+    "takt_minute": ("input_number.planer_takt_minute", 55, 0, 59, True),
+}
+REGLER_LETZTE = {}
+
+
+def lese_regler(opts):
+    # Legt die Regler-Werte aus HA ueber die Add-on-Optionen. Ist ein Helfer
+    # unlesbar (HA-Neustart, geloescht), gilt sein letzter gelesener Wert, beim
+    # allerersten Lauf der Default, mit WARNUNG im Log.
+    r = dict(opts)
+    for key, (entity, default, lo, hi, ganz) in REGLER.items():
+        wert = zahl(entity, None)
+        if wert is None or math.isnan(wert):
+            wert = REGLER_LETZTE.get(key, default)
+            log("WARNUNG: %s nicht lesbar, nehme %s." % (entity, wert))
+        wert = min(hi, max(lo, wert))
+        if ganz:
+            wert = int(round(wert))
+        REGLER_LETZTE[key] = wert
+        r[key] = wert
+    return r
 
 
 def reservationswert(pk, cfg, export_ok):
@@ -700,7 +731,7 @@ def optimiere(imp, ter, netto, soc_start_kwh, einstand_start, rt, puffer, entl_m
     # halbvoller Abend. Ein Aufschlag auf ALLE Ladequellen verschob im Test
     # die Nutzung des Startinhalts (Selbsttest 4b rot, ein Fall -1,8 ct/Tag),
     # darum wirkt er nur zwischen PV-Stunden derselben Senke.
-    # lad_netz_max_w (1.6.0): Netzladung je Stunde in W, Option netz_lade_max_w.
+    # lad_netz_max_w (1.6.0): Netzladung je Stunde in W (seit 1.7.0 B1 max. Ladeleistung).
     # Voll-dynamischer, verlustfreier Stunden-Optimierer (greedy best-pair).
     # 1:1-Port aus batterie_schatten.ps1; Eingaben in Meter-kWh, SoC-Bahn in
     # gespeicherten kWh.
@@ -1411,20 +1442,18 @@ def _selbsttest_kern():
                 fehler.append("Szenario 8: dst_sperre(%s, ab %d) = %s, erwartet %s."
                               % (tag0.date(), ab, not soll, soll))
 
-    # Szenario 9 (1.6.0): Netzladung als Option. Leerer Akku, zwei billige
-    # Stunden (12/13), Abendbedarf 17-21 Uhr ueber 800 W, sonst kein Handel
-    # (Rest des Tages teurer als Abendwert mal rt, kein Export). Mit dem
-    # Default 2000 W (9a) bleibt jede Stunde bei 2 kWh und der Akku wird im Tal
-    # nicht voll; mit 2500 W (9b) laedt er mehr, die Bilanz steigt, Plan und
-    # Notbremse folgen der Option, und die Default-Notbremse lehnt 2500 W ab.
-    for (o, ha, soll) in (({}, None, 2000), ({"netz_lade_max_w": 2500}, None, 2500),
-                          ({"netz_lade_max_w": 2500}, 2200, 2200),
-                          ({"netz_lade_max_w": 9000}, None, 2500),
-                          ({"netz_lade_max_w": 100}, None, 250),
-                          ({"netz_lade_max_w": "x"}, None, 2000)):
-        if netz_lade_max(o, ha) != soll:
-            fehler.append("Szenario 9: netz_lade_max(%s, %s) = %d, erwartet %d."
-                          % (o, ha, netz_lade_max(o, ha), soll))
+    # Szenario 9 (1.6.0, Klemme seit 1.7.0 aus B1 max. Ladeleistung): Leerer
+    # Akku, zwei billige Stunden (12/13), Abendbedarf 17-21 Uhr ueber 800 W,
+    # sonst kein Handel (Rest des Tages teurer als Abendwert mal rt, kein
+    # Export). Mit dem Default 2000 W (9a) bleibt jede Stunde bei 2 kWh und der
+    # Akku wird im Tal nicht voll; mit 2500 W (9b) laedt er mehr, die Bilanz
+    # steigt, Plan und Notbremse folgen der Grenze, und die Default-Notbremse
+    # lehnt 2500 W ab.
+    for (ha, soll) in ((2500, 2500), (2200, 2200), (9000, 2500), (100, 250),
+                       (-1, 2000), (None, 2000), ("x", 2000)):
+        if netz_lade_max(ha) != soll:
+            fehler.append("Szenario 9: netz_lade_max(%s) = %d, erwartet %d."
+                          % (ha, netz_lade_max(ha), soll))
     beurs9 = [0.36] * 24
     beurs9[12] = beurs9[13] = 0.0
     for h in range(17, 22):
@@ -1715,8 +1744,8 @@ def rechne_und_publiziere(plan_tag, ab_stunde, pv_entity, pv_feld, state, opts, 
     # Warte-Aufschlag (1.5.0): frueher laden schlaegt eine spaetere, kaum
     # billigere Stunde; Option 0 = Reihenfolge wie bis 1.4.0.
     frueh = frueh_aufschlag(opts)
-    # Netzladung je Stunde (1.6.0): Option netz_lade_max_w, gekappt am HA-Maximum.
-    lad_max_w = netz_lade_max(opts, cfg["lad_max_ha"])
+    # Netzladung je Stunde: B1 max. Ladeleistung der Marstek (1.7.0).
+    lad_max_w = netz_lade_max(cfg["lad_max_ha"])
     opt = optimiere(pk["imp"], pk["ter"], netto, soc_start_kwh, einstand,
                     cfg["rt"], cfg["puffer"], cfg["entl_max_w"], export_ok, reservation,
                     frueh, lad_max_w)
@@ -1854,10 +1883,8 @@ def main():
     log("Selbsttest bestanden (9 Szenarien: Block-Bewertung, Sunk-Cost-Dreieck, Gegenprobe ohne "
         "billigen Nachkauf, Bonusfenster, Halte-Schwelle ohne Saldering mit Gegenprobe, "
         "Zeitplan der Laeufe, Warte-Aufschlag mit Gegenproben und Startinhalt-Schutz, "
-        "DST-Sperre nur bis 02:00, Netzladung als Option mit Notbremse).")
+        "DST-Sperre nur bis 02:00, Netzladung-Grenze mit Notbremse).")
     opts = lade_json(OPTIONS_PATH, {})
-    takt = int(opts.get("takt_minute", 55))
-    profil_tage = int(opts.get("profil_tage", 14))
 
     for versuch in range(30):
         try:
@@ -1871,11 +1898,16 @@ def main():
     if TZ is None:
         raise SystemExit("HA-API nicht erreichbar, Abbruch.")
 
+    # Regler aus HA (1.7.0); takt und profil_tage werden in jedem Lauf neu gelesen.
+    opts = lese_regler(opts)
+    takt = opts["takt_minute"]
+    profil_tage = opts["profil_tage"]
     log("Batterie-Planer v2 gestartet (Takt hh:%02d, Tageslauf 00:00:%02d, Vorschau Folgetag "
         "sobald die Beurs-Kurve da ist, Einstand %.2f, Profil %d Tage, Warte-Aufschlag %.2f ct/h, "
-        "Netzladung max %d W)."
+        "Netzladung max %d W; Regler aus dem Config-Dashboard)."
         % (takt, MITTERNACHT_SEKUNDE, float(opts.get("einstand_start", 0.15)), profil_tage,
-           frueh_aufschlag(opts) * 100, netz_lade_max(opts)))
+           frueh_aufschlag(opts) * 100,
+           netz_lade_max(zahl("number.marstek_venus_modbus_maximale_ladeleistung", -1))))
 
     state = lade_json(STATE_PATH, {"tage": {}})
     if "tage" not in state:
@@ -1902,12 +1934,18 @@ def main():
         time.sleep(max(5.0, (ziel - jetzt()).total_seconds()))
         name = "Tageslauf" if mitternacht else "Stundenlauf"
         try:
-            opts = lade_json(OPTIONS_PATH, opts)
+            opts = lese_regler(lade_json(OPTIONS_PATH, opts))
+            if opts["takt_minute"] != takt or opts["profil_tage"] != profil_tage:
+                log("Regler geaendert: Takt hh:%02d -> hh:%02d, Profil %d -> %d Tage."
+                    % (takt, opts["takt_minute"], profil_tage, opts["profil_tage"]))
+            takt = opts["takt_minute"]
+            neu_profil = opts["profil_tage"] != profil_tage
+            profil_tage = opts["profil_tage"]
             lauf = jetzt()
             if mitternacht:
                 plan_heute(state, opts, voll=True)
             else:
-                if lauf.hour == 1:
+                if lauf.hour == 1 or neu_profil:
                     state = lade_json(STATE_PATH, state)
                     state = profil_auffuellen(state, profil_tage)
                 plan_heute(state, opts)

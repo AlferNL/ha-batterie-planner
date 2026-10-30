@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.7.0 (2026-10-30)
+
+- **Regler ins Config-Dashboard.** Andre 2026-10-30: "Sollte das nicht alles
+  variabel sein und ueber das Config-Dashboard einzustellen?" Bisher waren
+  Takt, Profiltage, Warte-Aufschlag und Netzladung Add-on-Optionen: nicht im
+  Dashboard sichtbar, jede Aenderung brauchte einen Add-on-Neustart. Jetzt
+  liest der Planer in jedem Lauf `input_number.planer_warte_aufschlag`,
+  `input_number.planer_profiltage` und `input_number.planer_takt_minute`
+  (Abschnitt Batterie-Planer v2 der Ansicht Konfig). Unlesbar gilt der
+  letzte gelesene Wert, beim ersten Lauf der Default, mit WARNUNG.
+- **Netzladung = B1 max. Ladeleistung.** Wie die Entladung folgt die
+  Ladegrenze dem Wert der Marstek (`number.marstek_venus_modbus_maximale_ladeleistung`,
+  geklemmt 250 bis 2500 W, unlesbar 2000 W); die Option `netz_lade_max_w`
+  aus 1.6.0 entfaellt.
+- Add-on-Optionen: nur noch `einstand_start` (Startwert, nur beim ersten
+  Start ohne State gebraucht). Die alten Schluessel verwirft der Supervisor
+  beim Update.
+- Eine Aenderung der Profiltage fuellt den Profil-Vorrat sofort nach (bisher
+  nur um 01 Uhr), eine Takt-Aenderung greift ab dem uebernaechsten Lauf.
+- Trockenlauf gegen HA mit den echten Reglern (1 ct, 3 Tage, :48, 2500 W):
+  identisch mit 1.6.0 (ganzer Tag -4,20 EUR).
+
+
 ## 1.6.0 (2026-10-30)
 
 - **Netzladung als Option** (neue Option `netz_lade_max_w`, Default 2000 W,
